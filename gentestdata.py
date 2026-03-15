@@ -31,7 +31,6 @@ os.makedirs(OUT, exist_ok=True)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 def rng_floats(n_samples, n_features, nan_frac=0.0):
     """Generate float matrix, optionally injecting NaNs."""
     X = RNG.standard_normal((n_samples, n_features)).astype(np.float32)
@@ -58,12 +57,32 @@ def build_pool(X_float, X_cat=None, y=None, cat_col_offset=0):
     return cb.Pool(X, y, cat_features=cat_features if cat_features else None)
 
 
-def predict_raw(model, X_float, X_cat=None, cat_col_offset=0):
-    """Return RawFormulaVal predictions as list-of-lists."""
+def predict(
+    model, X_float, X_cat=None, cat_col_offset=0, prediction_type="RawFormulaVal"
+):
     pool = build_pool(X_float, X_cat, cat_col_offset=cat_col_offset)
-    preds = model.predict(pool, prediction_type="RawFormulaVal")
-    if preds.ndim == 1:
+    preds = model.predict(pool, prediction_type=prediction_type)
+
+    is_classifier = isinstance(model, cb.CatBoostClassifier)
+    n_classes = len(model.classes_) if is_classifier else 1
+    is_binary = is_classifier and n_classes == 2
+    is_multiclass = is_classifier and n_classes > 2
+
+    if prediction_type in ("Probability", "LogProbability") and is_binary:
+        # Python: (N, 2)  →  Go: (N, 1) using P(class=1)
+        preds = preds[:, 1].reshape(-1, 1)
+    elif prediction_type == "Class" and is_multiclass:
+        # Python: (N, 1) class index  →  Go: (N, K) one-hot
+        idx = preds.flatten().astype(int)
+        one_hot = np.zeros((len(idx), n_classes), dtype=float)
+        one_hot[np.arange(len(idx)), idx] = 1.0
+        preds = one_hot
+    elif prediction_type == "Class" and is_binary:
+        # Python: (N,) int64  →  Go: (N, 1) float
+        preds = preds.reshape(-1, 1).astype(float)
+    elif preds.ndim == 1:
         preds = preds.reshape(-1, 1)
+
     return preds.tolist()
 
 
@@ -78,23 +97,45 @@ def samples_json(X_float, X_cat=None):
     return samples
 
 
-def save(name, model, X_test_float, X_test_cat, float_count, cat_count, output_dim,
-         cat_col_offset=0, description=""):
+def save(
+    name,
+    model,
+    X_test_float,
+    X_test_cat,
+    float_count,
+    cat_count,
+    output_dim,
+    cat_col_offset=0,
+    description="",
+    prediction_type="RawFormulaVal",
+):
     model.save_model(os.path.join(OUT, f"{name}.cbm"), format="CatboostBinary")
 
-    preds = predict_raw(model, X_test_float, X_test_cat, cat_col_offset=cat_col_offset)
+    preds = predict(
+        model,
+        X_test_float,
+        X_test_cat,
+        cat_col_offset=cat_col_offset,
+        prediction_type=prediction_type,
+    )
+    actual_dim = len(preds[0]) if preds else output_dim
     fixture = {
         "description": description,
         "float_feature_count": float_count,
         "cat_feature_count": cat_count,
-        "output_dimension": output_dim,
+        "output_dimension": actual_dim,
         "samples": samples_json(X_test_float, X_test_cat),
         "predictions": preds,
     }
+    if prediction_type != "RawFormulaVal":
+        fixture["prediction_type"] = prediction_type
     with open(os.path.join(OUT, f"{name}.json"), "w") as f:
         json.dump(fixture, f, indent=2)
 
-    print(f"  [{name}] dim={output_dim} float={float_count} cat={cat_count} samples={len(preds)}")
+    print(
+        f"  [{name}] dim={actual_dim} float={float_count} cat={cat_count} "
+        f"samples={len(preds)} prediction_type={prediction_type}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -103,17 +144,34 @@ def save(name, model, X_test_float, X_test_cat, float_count, cat_count, output_d
 def gen_float_regression():
     n = 2000
     X = rng_floats(n, 6)
-    y = X[:, 0] * 2 - X[:, 1] + X[:, 2] * 0.5 + RNG.standard_normal(n).astype(np.float32) * 0.1
+    y = (
+        X[:, 0] * 2
+        - X[:, 1]
+        + X[:, 2] * 0.5
+        + RNG.standard_normal(n).astype(np.float32) * 0.1
+    )
 
     model = cb.CatBoostRegressor(
-        iterations=200, depth=6, learning_rate=0.05,
-        verbose=False, random_seed=1,
+        iterations=200,
+        depth=6,
+        learning_rate=0.05,
+        verbose=False,
+        random_seed=1,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 6)
-    save("float_regression", model, X_test, None, 6, 0, 1,
-         description="Regression on 6 float features")
+    save(
+        "float_regression",
+        model,
+        X_test,
+        None,
+        float_count=6,
+        cat_count=0,
+        output_dim=1,
+        description="Regression on 6 float features",
+        prediction_type="Exponent",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +183,26 @@ def gen_float_binary():
     y = (X[:, 0] + X[:, 1] * 2 - X[:, 2] > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=150, depth=6, learning_rate=0.1,
-        verbose=False, random_seed=2,
+        iterations=150,
+        depth=6,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=2,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 5)
-    save("float_binary", model, X_test, None, 5, 0, 1,
-         description="Binary classification on 5 float features")
+    save(
+        "float_binary",
+        model,
+        X_test,
+        None,
+        float_count=5,
+        cat_count=0,
+        output_dim=1,
+        description="Binary classification on 5 float features",
+        prediction_type="Probability",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -144,15 +214,28 @@ def gen_multiclass_3():
     y = np.argmax(X[:, :3], axis=1)
 
     model = cb.CatBoostClassifier(
-        iterations=150, depth=5, learning_rate=0.1,
-        verbose=False, random_seed=3, classes_count=3,
+        iterations=150,
+        depth=5,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=3,
+        classes_count=3,
         loss_function="MultiClass",
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 4)
-    save("multiclass_3", model, X_test, None, 4, 0, 3,
-         description="3-class classification on 4 float features")
+    save(
+        "multiclass_3",
+        model,
+        X_test,
+        None,
+        float_count=4,
+        cat_count=0,
+        output_dim=3,
+        description="3-class classification on 4 float features",
+        prediction_type="Probability",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,15 +247,27 @@ def gen_multiclass_5():
     y = np.argmax(X[:, :5], axis=1)
 
     model = cb.CatBoostClassifier(
-        iterations=200, depth=5, learning_rate=0.1,
-        verbose=False, random_seed=4, classes_count=5,
+        iterations=200,
+        depth=5,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=4,
+        classes_count=5,
         loss_function="MultiClass",
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 6)
-    save("multiclass_5", model, X_test, None, 6, 0, 5,
-         description="5-class classification on 6 float features")
+    save(
+        "multiclass_5",
+        model,
+        X_test,
+        None,
+        float_count=6,
+        cat_count=0,
+        output_dim=5,
+        description="5-class classification on 6 float features",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -186,16 +281,28 @@ def gen_cat_onehot_small():
     y = (X_float[:, 0] + (X_cat[:, 0] == "cat").astype(float) > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=100, depth=4, learning_rate=0.1,
-        verbose=False, random_seed=5, one_hot_max_size=10,
+        iterations=100,
+        depth=4,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=5,
+        one_hot_max_size=10,
     )
     model.fit(build_pool(X_float, X_cat, y, cat_col_offset=3))
 
     X_test_f = rng_floats(20, 3)
     X_test_c = rng_cats(20, vocab)
-    save("cat_onehot_small", model, X_test_f, X_test_c, 3, 1, 1,
-         cat_col_offset=3,
-         description="Binary classification, 4-value one-hot cat + 3 floats")
+    save(
+        "cat_onehot_small",
+        model,
+        X_test_f,
+        X_test_c,
+        float_count=3,
+        cat_count=1,
+        output_dim=1,
+        cat_col_offset=3,
+        description="Binary classification, 4-value one-hot cat + 3 floats",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,11 +314,13 @@ def gen_multi_cat():
     vocab_b = ["small", "medium", "large", "xlarge"]
     vocab_c = ["yes", "no"]
     X_float = rng_floats(n, 2)
-    X_cat = np.column_stack([
-        rng_cats(n, vocab_a),
-        rng_cats(n, vocab_b),
-        rng_cats(n, vocab_c),
-    ])
+    X_cat = np.column_stack(
+        [
+            rng_cats(n, vocab_a),
+            rng_cats(n, vocab_b),
+            rng_cats(n, vocab_c),
+        ]
+    )
     y = (
         X_float[:, 0]
         + (X_cat[:, 0] == "red").astype(float)
@@ -220,20 +329,34 @@ def gen_multi_cat():
     ).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=100, depth=4, learning_rate=0.1,
-        verbose=False, random_seed=6, one_hot_max_size=10,
+        iterations=100,
+        depth=4,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=6,
+        one_hot_max_size=10,
     )
     model.fit(build_pool(X_float, X_cat, y, cat_col_offset=2))
 
     X_test_f = rng_floats(20, 2)
-    X_test_c = np.column_stack([
-        rng_cats(20, vocab_a),
-        rng_cats(20, vocab_b),
-        rng_cats(20, vocab_c),
-    ])
-    save("multi_cat", model, X_test_f, X_test_c, 2, 3, 1,
-         cat_col_offset=2,
-         description="3 one-hot cat features + 2 floats, binary classification")
+    X_test_c = np.column_stack(
+        [
+            rng_cats(20, vocab_a),
+            rng_cats(20, vocab_b),
+            rng_cats(20, vocab_c),
+        ]
+    )
+    save(
+        "multi_cat",
+        model,
+        X_test_f,
+        X_test_c,
+        float_count=2,
+        cat_count=3,
+        output_dim=1,
+        cat_col_offset=2,
+        description="3 one-hot cat features + 2 floats, binary classification",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +372,12 @@ def gen_unknown_cat():
     y = (X_float[:, 0] > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=80, depth=4, learning_rate=0.1,
-        verbose=False, random_seed=7, one_hot_max_size=10,
+        iterations=80,
+        depth=4,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=7,
+        one_hot_max_size=10,
     )
     model.fit(build_pool(X_float, X_cat, y, cat_col_offset=2))
 
@@ -259,9 +386,17 @@ def gen_unknown_cat():
     known = [["alpha"], ["beta"], ["gamma"], ["delta"]] * 2 + [["alpha"], ["beta"]]
     unknown = [["zzzunknown"], ["NEW_VALUE"]]
     X_test_c = np.array(known[:8] + unknown)
-    save("unknown_cat", model, X_test_f, X_test_c, 2, 1, 1,
-         cat_col_offset=2,
-         description="Includes unseen cat values at predict time (bin 0)")
+    save(
+        "unknown_cat",
+        model,
+        X_test_f,
+        X_test_c,
+        float_count=2,
+        cat_count=1,
+        output_dim=1,
+        cat_col_offset=2,
+        description="Includes unseen cat values at predict time (bin 0)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -274,15 +409,27 @@ def gen_nan_as_false():
     y = (np.nansum(X[:, :2], axis=1) > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=100, depth=5, learning_rate=0.1,
-        verbose=False, random_seed=8, nan_mode="Min",
+        iterations=100,
+        depth=5,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=8,
+        nan_mode="Min",
     )
     model.fit(cb.Pool(X, y))
 
     # Test samples contain NaN values.
     X_test = rng_floats(20, 4, nan_frac=0.25)
-    save("nan_as_false", model, X_test, None, 4, 0, 1,
-         description="Float features with NaN treated as Min (AsFalse)")
+    save(
+        "nan_as_false",
+        model,
+        X_test,
+        None,
+        float_count=4,
+        cat_count=0,
+        output_dim=1,
+        description="Float features with NaN treated as Min (AsFalse)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -294,14 +441,26 @@ def gen_nan_as_true():
     y = (np.nansum(X[:, :2], axis=1) > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=100, depth=5, learning_rate=0.1,
-        verbose=False, random_seed=9, nan_mode="Max",
+        iterations=100,
+        depth=5,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=9,
+        nan_mode="Max",
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 4, nan_frac=0.25)
-    save("nan_as_true", model, X_test, None, 4, 0, 1,
-         description="Float features with NaN treated as Max (AsTrue)")
+    save(
+        "nan_as_true",
+        model,
+        X_test,
+        None,
+        float_count=4,
+        cat_count=0,
+        output_dim=1,
+        description="Float features with NaN treated as Max (AsTrue)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -314,15 +473,26 @@ def gen_many_borders():
     y = (X[:, 0] - X[:, 1] > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=100, depth=6, learning_rate=0.1,
-        verbose=False, random_seed=10,
+        iterations=100,
+        depth=6,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=10,
         border_count=500,  # forces >254 borders → multi-block quantization
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 3)
-    save("many_borders", model, X_test, None, 3, 0, 1,
-         description="Float features with >254 borders (multi-block quantization)")
+    save(
+        "many_borders",
+        model,
+        X_test,
+        None,
+        float_count=3,
+        cat_count=0,
+        output_dim=1,
+        description="Float features with >254 borders (multi-block quantization)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -339,8 +509,11 @@ def gen_many_cat_values():
     y = (X_float[:, 0] > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=50, depth=4, learning_rate=0.1,
-        verbose=False, random_seed=11,
+        iterations=50,
+        depth=4,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=11,
         one_hot_max_size=300,
     )
     model.fit(build_pool(X_float, X_cat, y, cat_col_offset=2))
@@ -350,9 +523,17 @@ def gen_many_cat_values():
     known = RNG.choice(vocab, 18).reshape(-1, 1).tolist()
     unseen = [["val_NEW_A"], ["val_NEW_B"]]
     X_test_c = np.array(known + unseen)
-    save("many_cat_values", model, X_test_f, X_test_c, 2, 1, 1,
-         cat_col_offset=2,
-         description="300-value one-hot (multi-block), includes unseen values")
+    save(
+        "many_cat_values",
+        model,
+        X_test_f,
+        X_test_c,
+        float_count=2,
+        cat_count=1,
+        output_dim=1,
+        cat_col_offset=2,
+        description="300-value one-hot (multi-block), includes unseen values",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -364,14 +545,25 @@ def gen_deep_trees():
     y = (X[:, 0] + X[:, 1] > X[:, 2] + X[:, 3]).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=100, depth=8, learning_rate=0.05,
-        verbose=False, random_seed=12,
+        iterations=100,
+        depth=8,
+        learning_rate=0.05,
+        verbose=False,
+        random_seed=12,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 8)
-    save("deep_trees", model, X_test, None, 8, 0, 1,
-         description="Trees of depth 8")
+    save(
+        "deep_trees",
+        model,
+        X_test,
+        None,
+        float_count=8,
+        cat_count=0,
+        output_dim=1,
+        description="Trees of depth 8",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -383,14 +575,25 @@ def gen_shallow_trees():
     y = (X[:, 0] > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=200, depth=1, learning_rate=0.1,
-        verbose=False, random_seed=13,
+        iterations=200,
+        depth=1,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=13,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 4)
-    save("shallow_trees", model, X_test, None, 4, 0, 1,
-         description="Decision stumps (depth 1)")
+    save(
+        "shallow_trees",
+        model,
+        X_test,
+        None,
+        float_count=4,
+        cat_count=0,
+        output_dim=1,
+        description="Decision stumps (depth 1)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,14 +605,25 @@ def gen_single_tree():
     y = (X[:, 0] > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=1, depth=4, learning_rate=1.0,
-        verbose=False, random_seed=14,
+        iterations=1,
+        depth=4,
+        learning_rate=1.0,
+        verbose=False,
+        random_seed=14,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 3)
-    save("single_tree", model, X_test, None, 3, 0, 1,
-         description="Model with a single tree")
+    save(
+        "single_tree",
+        model,
+        X_test,
+        None,
+        float_count=3,
+        cat_count=0,
+        output_dim=1,
+        description="Model with a single tree",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -421,14 +635,25 @@ def gen_large_features():
     y = (X[:, :5].sum(axis=1) > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=200, depth=6, learning_rate=0.1,
-        verbose=False, random_seed=15,
+        iterations=200,
+        depth=6,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=15,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 50)
-    save("large_features", model, X_test, None, 50, 0, 1,
-         description="50 float features")
+    save(
+        "large_features",
+        model,
+        X_test,
+        None,
+        float_count=50,
+        cat_count=0,
+        output_dim=1,
+        description="50 float features",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -445,16 +670,27 @@ def gen_extreme_values():
     y = (X[:, 0] > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=100, depth=4, learning_rate=0.1,
-        verbose=False, random_seed=16,
+        iterations=100,
+        depth=4,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=16,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 3)
     X_test[:, 0] *= 1e6
     X_test[:, 1] *= 1e-6
-    save("extreme_values", model, X_test, None, 3, 0, 1,
-         description="Float features with extreme magnitudes")
+    save(
+        "extreme_values",
+        model,
+        X_test,
+        None,
+        float_count=3,
+        cat_count=0,
+        output_dim=1,
+        description="Float features with extreme magnitudes",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -467,21 +703,38 @@ def gen_mixed_multiclass():
     X_float = rng_floats(n, 3)
     X_cat = np.column_stack([rng_cats(n, vocab_a), rng_cats(n, vocab_b)])
     # 3-class label
-    raw = X_float[:, 0] + (X_cat[:, 0] == "A").astype(float) - (X_cat[:, 1] == "z").astype(float)
+    raw = (
+        X_float[:, 0]
+        + (X_cat[:, 0] == "A").astype(float)
+        - (X_cat[:, 1] == "z").astype(float)
+    )
     y = np.clip(np.floor(raw + 1.5).astype(int), 0, 2)
 
     model = cb.CatBoostClassifier(
-        iterations=150, depth=5, learning_rate=0.1,
-        verbose=False, random_seed=17,
-        one_hot_max_size=10, classes_count=3, loss_function="MultiClass",
+        iterations=150,
+        depth=5,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=17,
+        one_hot_max_size=10,
+        classes_count=3,
+        loss_function="MultiClass",
     )
     model.fit(build_pool(X_float, X_cat, y, cat_col_offset=3))
 
     X_test_f = rng_floats(20, 3)
     X_test_c = np.column_stack([rng_cats(20, vocab_a), rng_cats(20, vocab_b)])
-    save("mixed_multiclass", model, X_test_f, X_test_c, 3, 2, 3,
-         cat_col_offset=3,
-         description="3-class, 3 floats + 2 one-hot cat features")
+    save(
+        "mixed_multiclass",
+        model,
+        X_test_f,
+        X_test_c,
+        float_count=3,
+        cat_count=2,
+        output_dim=3,
+        cat_col_offset=3,
+        description="3-class, 3 floats + 2 one-hot cat features",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -493,14 +746,26 @@ def gen_nonsym_regression():
     y = X[:, 0] * 2 - X[:, 1] + X[:, 2] * 0.5
 
     model = cb.CatBoostRegressor(
-        iterations=200, learning_rate=0.05, verbose=False,
-        random_seed=20, grow_policy="Lossguide", max_leaves=16,
+        iterations=200,
+        learning_rate=0.05,
+        verbose=False,
+        random_seed=20,
+        grow_policy="Lossguide",
+        max_leaves=16,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 6)
-    save("nonsym_regression", model, X_test, None, 6, 0, 1,
-         description="Non-symmetric regression (Lossguide, max_leaves=16)")
+    save(
+        "nonsym_regression",
+        model,
+        X_test,
+        None,
+        float_count=6,
+        cat_count=0,
+        output_dim=1,
+        description="Non-symmetric regression (Lossguide, max_leaves=16)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -512,14 +777,27 @@ def gen_nonsym_binary():
     y = (X[:, 0] + X[:, 1] * 2 - X[:, 2] > 0).astype(int)
 
     model = cb.CatBoostClassifier(
-        iterations=150, learning_rate=0.1, verbose=False,
-        random_seed=21, grow_policy="Lossguide", max_leaves=16,
+        iterations=150,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=21,
+        grow_policy="Lossguide",
+        max_leaves=16,
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 5)
-    save("nonsym_binary", model, X_test, None, 5, 0, 1,
-         description="Non-symmetric binary classification (Lossguide, max_leaves=16)")
+    save(
+        "nonsym_binary",
+        model,
+        X_test,
+        None,
+        float_count=5,
+        cat_count=0,
+        output_dim=1,
+        description="Non-symmetric binary classification (Lossguide, max_leaves=16)",
+        prediction_type="Class",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -531,15 +809,28 @@ def gen_nonsym_multiclass():
     y = np.argmax(X[:, :3], axis=1)
 
     model = cb.CatBoostClassifier(
-        iterations=150, learning_rate=0.1, verbose=False,
-        random_seed=22, grow_policy="Depthwise", depth=5,
-        classes_count=3, loss_function="MultiClass",
+        iterations=150,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=22,
+        grow_policy="Depthwise",
+        depth=5,
+        classes_count=3,
+        loss_function="MultiClass",
     )
     model.fit(cb.Pool(X, y))
 
     X_test = rng_floats(20, 4)
-    save("nonsym_multiclass", model, X_test, None, 4, 0, 3,
-         description="Non-symmetric 3-class classification (Depthwise)")
+    save(
+        "nonsym_multiclass",
+        model,
+        X_test,
+        None,
+        float_count=4,
+        cat_count=0,
+        output_dim=3,
+        description="Non-symmetric 3-class classification (Depthwise)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +865,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "names", nargs="*",
+        "names",
+        nargs="*",
         help="Names of fixtures to regenerate (default: all)",
     )
     args = parser.parse_args()
@@ -584,9 +876,10 @@ if __name__ == "__main__":
     print(f"Generating test fixtures → {OUT}/")
     for gen in GENERATORS:
         # Derive fixture name from function name: gen_foo_bar → foo_bar
-        fixture_name = gen.__name__[len("gen_"):]
+        fixture_name = gen.__name__[len("gen_") :]
         if selected and fixture_name not in selected:
             continue
         gen()
 
-    print(f"\nDone. {len(GENERATORS) if not selected else len(selected)} fixture(s) written to {OUT}/")
+    count = len(GENERATORS) if not selected else len(selected)
+    print(f"\nDone. {count} fixture(s) written to {OUT}/")

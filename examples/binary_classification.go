@@ -16,7 +16,7 @@ func runBinaryClassification() {
 	fmt.Println("=== Binary Classification ===")
 	fmt.Printf("float features: %d\n", m.FloatFeaturesCount())
 
-	m.SetPredictionType(catboost.Probability)
+	m.SetPredictionType(catboost.PredictionTypeProbability)
 
 	floats := []float32{0.572, 0.100, -1.567, -1.818, 1.509}
 	result, err := m.CalcSingle(floats, nil)

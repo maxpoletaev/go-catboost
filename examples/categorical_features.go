@@ -16,7 +16,7 @@ func runCategoricalFeatures() {
 	fmt.Println("=== Categorical Features ===")
 	fmt.Printf("float features: %d, cat features: %d\n", m.FloatFeaturesCount(), m.CatFeaturesCount())
 
-	m.SetPredictionType(catboost.Probability)
+	m.SetPredictionType(catboost.PredictionTypeProbability)
 
 	// Cat features are passed as raw strings; the model hashes them internally.
 	// An unseen value is silently treated as "no match" for all one-hot splits.

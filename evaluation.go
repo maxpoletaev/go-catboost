@@ -1,6 +1,8 @@
 package catboost
 
-import "math"
+import (
+	"math"
+)
 
 func (m *Model) eval(bins []uint8) []float64 {
 	var result []float64
@@ -14,23 +16,27 @@ func (m *Model) eval(bins []uint8) []float64 {
 }
 
 func (m *Model) applyPredictionType(result []float64) {
+	isBinary := m.approxDimension == 1
+
 	switch m.predictionType {
-	case Probability:
-		if m.approxDimension == 1 {
+	case PredictionTypeRawFormulaVal:
+		// no transformation
+	case PredictionTypeProbability:
+		if isBinary {
 			sigmoid(result)
 		} else {
 			softmax(result)
 		}
-	case Class:
-		if m.approxDimension == 1 {
+	case PredictionTypeClass:
+		if isBinary {
 			binclass(result)
 		} else {
 			argmax(result)
 		}
-	case Exponent:
+	case PredictionTypeExponent:
 		exponent(result)
-	case LogProbability:
-		if m.approxDimension == 1 {
+	case PredictionTypeLogProbability:
+		if isBinary {
 			logSigmoid(result)
 		} else {
 			logSoftmax(result)

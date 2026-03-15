@@ -14,18 +14,16 @@ const (
 	maxValuesPerBin = 254
 )
 
-// PredictionType controls the post-processing applied to raw model scores.
 type PredictionType int
 
 const (
-	RawFormulaVal PredictionType = iota
-	Probability
-	Class
-	Exponent
-	LogProbability
+	PredictionTypeRawFormulaVal PredictionType = iota
+	PredictionTypeProbability
+	PredictionTypeClass
+	PredictionTypeExponent
+	PredictionTypeLogProbability
 )
 
-// nanValueTreatment mirrors the FlatBuffers enum.
 type nanValueTreatment int8
 
 const (
@@ -190,7 +188,7 @@ func (m *Model) CalcSingle(floatFeatures []float32, catFeatures []string) ([]flo
 	if err := m.validateInputs(floatFeatures, catFeatures); err != nil {
 		return nil, err
 	}
-	bins := quantize(m, floatFeatures, hashCatFeatures(catFeatures))
+	bins := m.quantize(floatFeatures, hashCatFeatures(catFeatures))
 	return m.eval(bins), nil
 }
 
@@ -201,7 +199,7 @@ func (m *Model) CalcHashedSingle(floatFeatures []float32, catHashes []int32) ([]
 	if err := m.validateHashedInputs(floatFeatures, catHashes); err != nil {
 		return nil, err
 	}
-	bins := quantize(m, floatFeatures, catHashes)
+	bins := m.quantize(floatFeatures, catHashes)
 	return m.eval(bins), nil
 }
 
@@ -223,7 +221,7 @@ func (m *Model) Calc(floatFeatures [][]float32, catFeatures [][]string) ([][]flo
 		if err := m.validateInputs(floatFeatures[i], cats); err != nil {
 			return nil, fmt.Errorf("document %d: %w", i, err)
 		}
-		bins := quantize(m, floatFeatures[i], hashCatFeatures(cats))
+		bins := m.quantize(floatFeatures[i], hashCatFeatures(cats))
 		results[i] = m.eval(bins)
 	}
 	return results, nil
@@ -246,7 +244,7 @@ func (m *Model) CalcHashed(floatFeatures [][]float32, catHashes [][]int32) ([][]
 		if err := m.validateHashedInputs(floatFeatures[i], hashes); err != nil {
 			return nil, fmt.Errorf("document %d: %w", i, err)
 		}
-		bins := quantize(m, floatFeatures[i], hashes)
+		bins := m.quantize(floatFeatures[i], hashes)
 		results[i] = m.eval(bins)
 	}
 	return results, nil

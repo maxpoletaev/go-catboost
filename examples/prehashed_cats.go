@@ -13,7 +13,7 @@ func runPrehashedCats() {
 		log.Fatalf("load model: %v", err)
 	}
 
-	m.SetPredictionType(catboost.Probability)
+	m.SetPredictionType(catboost.PredictionTypeProbability)
 
 	fmt.Println("=== Pre-hashed Categorical Features ===")
 

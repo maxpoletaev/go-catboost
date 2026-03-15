@@ -3,7 +3,7 @@ package catboost
 import "math"
 
 // Ref: catboost/libs/model/cpu/quantization.h (BinarizeFeatures)
-func quantize(m *Model, floatVals []float32, catHashes []int32) []uint8 {
+func (m *Model) quantize(floatVals []float32, catHashes []int32) []uint8 {
 	bins := make([]uint8, m.effectiveBinCount)
 	pos := 0
 

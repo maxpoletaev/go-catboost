@@ -16,7 +16,7 @@ func runMulticlass() {
 	fmt.Println("=== Multiclass Classification ===")
 	fmt.Printf("float features: %d, classes: %d\n", m.FloatFeaturesCount(), m.DimensionsCount())
 
-	m.SetPredictionType(catboost.Probability)
+	m.SetPredictionType(catboost.PredictionTypeProbability)
 
 	floats := []float32{1.276, 0.091, 1.174, -1.932}
 	probs, err := m.CalcSingle(floats, nil)
