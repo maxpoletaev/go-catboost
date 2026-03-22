@@ -91,20 +91,31 @@ func toFloats(ns []nullableFloat) []float32 {
 	return out
 }
 
-// nearEqual reports whether a and b are equal within a small relative tolerance.
-// Underlying math in Go and Python can diverge slightly for exp, sigmoid, or
-// softmax, and last-bit differences can arise across CPU architectures (arm64
-// vs amd64), so exact comparison is not possible for those prediction types.
+// ulpDiff returns how many floats apart a and b are. This works because IEEE 754
+// bit patterns for same-sign floats are ordered the same way as integers, so we
+// can just subtract them. Unlike a fixed epsilon, this scales with the magnitude
+// of the values being compared.
+func ulpDiff(a, b float64) uint64 {
+	ai := math.Float64bits(a)
+	bi := math.Float64bits(b)
+	if ai > bi {
+		return ai - bi
+	}
+	return bi - ai
+}
+
 func nearEqual(a, b float64) bool {
-	const tolerance = 1e-13
-	if a == b {
+	const maxULPs = 2
+	switch {
+	case a == b:
 		return true
+	case math.IsNaN(a) || math.IsNaN(b):
+		return false
+	case math.Signbit(a) != math.Signbit(b):
+		return false
+	default:
+		return ulpDiff(a, b) <= maxULPs
 	}
-	d := a - b
-	if d < 0 {
-		d = -d
-	}
-	return d <= tolerance
 }
 
 func loadFixture(t testing.TB, name string) (fixture, *catboost.Model) {
