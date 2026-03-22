@@ -114,9 +114,8 @@ func (m *Model) evalObliviousBatch(floatFeatures [][]float32, catHashes [][]int3
 
 	catCols := transpose(catHashes, m.catFeatureCount, n)
 	leafIndices := make([]uint32, n)
-	leafValues := m.leafValues
 
-	evalTreesScalar(m, floatFeatures, catHashes, catCols, leafIndices, leafValues, flat, n)
+	evalTrees(m, floatFeatures, catHashes, catCols, leafIndices, m.leafValues, flat, n)
 }
 
 func (m *Model) evalNonSymmetricBatch(floatFeatures [][]float32, catHashes [][]int32, results [][]float64) {
@@ -258,49 +257,48 @@ func argmax(result []float64) {
 	result[0] = float64(best)
 }
 
-func evalTreesScalar(m *Model, floatFeatures [][]float32, catHashes [][]int32, catCols [][]int32, leafIndices []uint32, leafValues []float64, flat []float64, n int) {
+func evalTrees(m *Model, floatFeatures [][]float32, catHashes [][]int32, catCols [][]int32, leafIndices []uint32, leafValues []float64, flat []float64, n int) {
 	dim := m.approxDimension
 	featCols := transpose(floatFeatures, m.floatFeatureCount, n)
 
 	for treeIdx := range m.treeSizes {
 		clear(leafIndices[:n])
+		evalTreeSplits(m, featCols, catCols, floatFeatures, catHashes, leafIndices, treeIdx, n)
+		accumulateLeaves(leafIndices[:n], leafValues, flat, m.treeFirstLeafOffset[treeIdx], dim, n)
+	}
+}
 
-		depth := m.treeSizes[treeIdx]
-		start := m.treeStartOffsets[treeIdx]
-		base := m.treeFirstLeafOffset[treeIdx]
-		splits := m.splits[start : start+depth]
+func evalTreeSplits(m *Model, featCols [][]float32, catCols [][]int32, floatFeatures [][]float32, catHashes [][]int32, leafIndices []uint32, treeIdx, n int) {
+	depth := m.treeSizes[treeIdx]
+	start := m.treeStartOffsets[treeIdx]
+	splits := m.splits[start : start+depth]
 
-		for d := range splits {
-			split := &splits[d]
-			bit := uint32(1) << d
+	for d := range splits {
+		split := &splits[d]
+		bit := uint32(1) << d
 
-			switch split.kind {
-			case splitKindFloat:
-				applySplitFloat(
-					featCols[split.featureIndex], split.border,
-					split.nanMode == nanAsTrue, leafIndices, bit, n,
-				)
-
-			case splitKindOneHot:
-				applySplitOneHot(
-					catCols[split.featureIndex], split.hashValue,
-					leafIndices, bit, n,
-				)
-
-			default:
-				for i := 0; i < n; i++ {
-					var cats []int32
-					if catHashes != nil {
-						cats = catHashes[i]
-					}
-					if m.evalSplit(split, floatFeatures[i], cats) {
-						leafIndices[i] |= bit
-					}
+		switch split.kind {
+		case splitKindFloat:
+			applySplitFloat(
+				featCols[split.featureIndex], split.border,
+				split.nanMode == nanAsTrue, leafIndices, bit, n,
+			)
+		case splitKindOneHot:
+			applySplitOneHot(
+				catCols[split.featureIndex], split.hashValue,
+				leafIndices, bit, n,
+			)
+		default:
+			for i := 0; i < n; i++ {
+				var cats []int32
+				if catHashes != nil {
+					cats = catHashes[i]
+				}
+				if m.evalSplit(split, floatFeatures[i], cats) {
+					leafIndices[i] |= bit
 				}
 			}
 		}
-
-		accumulateLeaves(leafIndices[:n], leafValues, flat, base, dim, n)
 	}
 }
 
@@ -313,9 +311,9 @@ func btou(b bool) (u uint32) {
 	return u
 }
 
-func applySplitFloat(col []float32, border float32, nanTrue bool, leafIndices []uint32, bit uint32, n int) {
+func applySplitFloatScalar(col []float32, border float32, nanTrue bool, leafIndices []uint32, bit uint32, n int) {
 	// Branchless split: -btou(cond) is 0x00000000 or 0xffffffff,
-	// so "bit & -btou(cond)" is bit or 0 without a branch.
+	// so "bit & -btou(cond)" is "bit" or 0 without a branch.
 	// Relies on the compiler inlining btou as CSET/SETcc.
 	if nanTrue {
 		i := 0
@@ -345,7 +343,7 @@ func applySplitFloat(col []float32, border float32, nanTrue bool, leafIndices []
 	}
 }
 
-func applySplitOneHot(col []int32, hashVal int32, leafIndices []uint32, bit uint32, n int) {
+func applySplitOneHotScalar(col []int32, hashVal int32, leafIndices []uint32, bit uint32, n int) {
 	i := 0
 	for ; i <= n-4; i += 4 {
 		leafIndices[i] |= bit & -btou(col[i] == hashVal)
@@ -359,12 +357,29 @@ func applySplitOneHot(col []int32, hashVal int32, leafIndices []uint32, bit uint
 }
 
 func accumulateLeaves(leafIndices []uint32, leafValues []float64, flat []float64, base, dim, n int) {
-	for i := 0; i < n; i++ {
-		leafStart := base + int(leafIndices[i])*dim
-		off := i * dim
-
+	lv := leafValues[base:]
+	i := 0
+	for ; i <= n-4; i += 4 {
+		s0 := int(leafIndices[i]) * dim
+		s1 := int(leafIndices[i+1]) * dim
+		s2 := int(leafIndices[i+2]) * dim
+		s3 := int(leafIndices[i+3]) * dim
+		o0 := i * dim
+		o1 := o0 + dim
+		o2 := o1 + dim
+		o3 := o2 + dim
 		for d := 0; d < dim; d++ {
-			flat[off+d] += leafValues[leafStart+d]
+			flat[o0+d] += lv[s0+d]
+			flat[o1+d] += lv[s1+d]
+			flat[o2+d] += lv[s2+d]
+			flat[o3+d] += lv[s3+d]
+		}
+	}
+	for ; i < n; i++ {
+		s := int(leafIndices[i]) * dim
+		off := i * dim
+		for d := 0; d < dim; d++ {
+			flat[off+d] += lv[s+d]
 		}
 	}
 }
