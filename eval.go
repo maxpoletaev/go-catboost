@@ -304,51 +304,43 @@ func evalTreesScalar(m *Model, floatFeatures [][]float32, catHashes [][]int32, c
 	}
 }
 
+func btou(b bool) (u uint32) {
+	if b {
+		u = 1
+	} else {
+		u = 0
+	}
+	return u
+}
+
 func applySplitFloat(col []float32, border float32, nanTrue bool, leafIndices []uint32, bit uint32, n int) {
+	// Branchless split: -btou(cond) is 0x00000000 or 0xffffffff,
+	// so "bit & -btou(cond)" is bit or 0 without a branch.
+	// Relies on the compiler inlining btou as CSET/SETcc.
 	if nanTrue {
 		i := 0
 		for ; i <= n-4; i += 4 {
 			v0, v1, v2, v3 := col[i], col[i+1], col[i+2], col[i+3]
-			if v0 > border || v0 != v0 {
-				leafIndices[i] |= bit
-			}
-			if v1 > border || v1 != v1 {
-				leafIndices[i+1] |= bit
-			}
-			if v2 > border || v2 != v2 {
-				leafIndices[i+2] |= bit
-			}
-			if v3 > border || v3 != v3 {
-				leafIndices[i+3] |= bit
-			}
+			leafIndices[i] |= bit & -btou(v0 > border || v0 != v0)
+			leafIndices[i+1] |= bit & -btou(v1 > border || v1 != v1)
+			leafIndices[i+2] |= bit & -btou(v2 > border || v2 != v2)
+			leafIndices[i+3] |= bit & -btou(v3 > border || v3 != v3)
 		}
 		for ; i < n; i++ {
 			v := col[i]
-			if v > border || v != v {
-				leafIndices[i] |= bit
-			}
+			leafIndices[i] |= bit & -btou(v > border || v != v)
 		}
 	} else {
 		i := 0
 		for ; i <= n-4; i += 4 {
 			v0, v1, v2, v3 := col[i], col[i+1], col[i+2], col[i+3]
-			if v0 > border {
-				leafIndices[i] |= bit
-			}
-			if v1 > border {
-				leafIndices[i+1] |= bit
-			}
-			if v2 > border {
-				leafIndices[i+2] |= bit
-			}
-			if v3 > border {
-				leafIndices[i+3] |= bit
-			}
+			leafIndices[i] |= bit & -btou(v0 > border)
+			leafIndices[i+1] |= bit & -btou(v1 > border)
+			leafIndices[i+2] |= bit & -btou(v2 > border)
+			leafIndices[i+3] |= bit & -btou(v3 > border)
 		}
 		for ; i < n; i++ {
-			if col[i] > border {
-				leafIndices[i] |= bit
-			}
+			leafIndices[i] |= bit & -btou(col[i] > border)
 		}
 	}
 }
@@ -356,23 +348,13 @@ func applySplitFloat(col []float32, border float32, nanTrue bool, leafIndices []
 func applySplitOneHot(col []int32, hashVal int32, leafIndices []uint32, bit uint32, n int) {
 	i := 0
 	for ; i <= n-4; i += 4 {
-		if col[i] == hashVal {
-			leafIndices[i] |= bit
-		}
-		if col[i+1] == hashVal {
-			leafIndices[i+1] |= bit
-		}
-		if col[i+2] == hashVal {
-			leafIndices[i+2] |= bit
-		}
-		if col[i+3] == hashVal {
-			leafIndices[i+3] |= bit
-		}
+		leafIndices[i] |= bit & -btou(col[i] == hashVal)
+		leafIndices[i+1] |= bit & -btou(col[i+1] == hashVal)
+		leafIndices[i+2] |= bit & -btou(col[i+2] == hashVal)
+		leafIndices[i+3] |= bit & -btou(col[i+3] == hashVal)
 	}
 	for ; i < n; i++ {
-		if col[i] == hashVal {
-			leafIndices[i] |= bit
-		}
+		leafIndices[i] |= bit & -btou(col[i] == hashVal)
 	}
 }
 
