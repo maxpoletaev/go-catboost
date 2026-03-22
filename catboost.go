@@ -72,9 +72,8 @@ type Model struct {
 
 	floatFeatureCount int
 	catFeatureCount   int
-	modelInfo        map[string]string
-	ctrFeatures      []ctrFeature
-
+	modelInfo         map[string]string
+	ctrFeatures       []ctrFeature
 }
 
 func nanSubstitution(mode nanMode) (float32, bool) {
@@ -88,6 +87,8 @@ func nanSubstitution(mode nanMode) (float32, bool) {
 	}
 }
 
+// LoadFromFile loads a CatBoost model from the given file path.
+// The file is expected to be in json format, optionally gzipped.
 func LoadFromFile(path string) (*Model, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -97,6 +98,8 @@ func LoadFromFile(path string) (*Model, error) {
 	return LoadFromReader(f)
 }
 
+// LoadFromReader loads a CatBoost model from the given reader.
+// The contents should be in json format.
 func LoadFromReader(r io.Reader) (*Model, error) {
 	var jm jsonModelFile
 

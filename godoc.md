@@ -26,7 +26,7 @@ import "github.com/maxpoletaev/go-catboost"
 
 
 <a name="CatFeatureHash"></a>
-## func [CatFeatureHash](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L249>)
+## func [CatFeatureHash](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L252>)
 
 ```go
 func CatFeatureHash(s string) uint32
@@ -35,7 +35,7 @@ func CatFeatureHash(s string) uint32
 CatFeatureHash returns the CatBoost hash for a categorical feature value.
 
 <a name="Model"></a>
-## type [Model](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L55-L78>)
+## type [Model](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L55-L77>)
 
 Model holds a deserialized CatBoost model ready for inference.
 
@@ -46,25 +46,25 @@ type Model struct {
 ```
 
 <a name="LoadFromFile"></a>
-### func [LoadFromFile](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L91>)
+### func [LoadFromFile](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L92>)
 
 ```go
 func LoadFromFile(path string) (*Model, error)
 ```
 
-
+LoadFromFile loads a CatBoost model from the given file path. The file is expected to be in json format, optionally gzipped.
 
 <a name="LoadFromReader"></a>
-### func [LoadFromReader](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L100>)
+### func [LoadFromReader](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L103>)
 
 ```go
 func LoadFromReader(r io.Reader) (*Model, error)
 ```
 
-
+LoadFromReader loads a CatBoost model from the given reader. The contents should be in json format.
 
 <a name="Model.Calc"></a>
-### func \(\*Model\) [Calc](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L159>)
+### func \(\*Model\) [Calc](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L162>)
 
 ```go
 func (m *Model) Calc(floatFeatures [][]float32, catFeatures [][]string) ([][]float64, error)
@@ -73,7 +73,7 @@ func (m *Model) Calc(floatFeatures [][]float32, catFeatures [][]string) ([][]flo
 Calc calculates predictions for multiple objects. Pass nil for catFeatures if the model has no categorical features.
 
 <a name="Model.CalcHashed"></a>
-### func \(\*Model\) [CalcHashed](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L194>)
+### func \(\*Model\) [CalcHashed](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L197>)
 
 ```go
 func (m *Model) CalcHashed(floatFeatures [][]float32, catHashes [][]int32) ([][]float64, error)
@@ -82,7 +82,7 @@ func (m *Model) CalcHashed(floatFeatures [][]float32, catHashes [][]int32) ([][]
 CalcHashed calculates predictions for multiple objects using pre\-computed cat hashes.
 
 <a name="Model.CalcHashedSingle"></a>
-### func \(\*Model\) [CalcHashedSingle](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L146>)
+### func \(\*Model\) [CalcHashedSingle](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L149>)
 
 ```go
 func (m *Model) CalcHashedSingle(floatFeatures []float32, catHashes []int32) ([]float64, error)
@@ -91,7 +91,7 @@ func (m *Model) CalcHashedSingle(floatFeatures []float32, catHashes []int32) ([]
 CalcHashedSingle calculates a prediction using pre\-computed cat feature hashes. Use CatFeatureHash to compute the hashes, which avoids re\-hashing on every call.
 
 <a name="Model.CalcSingle"></a>
-### func \(\*Model\) [CalcSingle](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L129>)
+### func \(\*Model\) [CalcSingle](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L132>)
 
 ```go
 func (m *Model) CalcSingle(floatFeatures []float32, catFeatures []string) ([]float64, error)
@@ -100,7 +100,7 @@ func (m *Model) CalcSingle(floatFeatures []float32, catFeatures []string) ([]flo
 CalcSingle calculates a prediction for a single object. Pass float32\(math.NaN\(\)\) for missing float values. Pass nil for catFeatures if the model has no categorical features.
 
 <a name="Model.CatFeaturesCount"></a>
-### func \(\*Model\) [CatFeaturesCount](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L224>)
+### func \(\*Model\) [CatFeaturesCount](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L227>)
 
 ```go
 func (m *Model) CatFeaturesCount() int
@@ -109,7 +109,7 @@ func (m *Model) CatFeaturesCount() int
 CatFeaturesCount returns the number of categorical features the model expects.
 
 <a name="Model.DimensionsCount"></a>
-### func \(\*Model\) [DimensionsCount](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L214>)
+### func \(\*Model\) [DimensionsCount](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L217>)
 
 ```go
 func (m *Model) DimensionsCount() int
@@ -118,7 +118,7 @@ func (m *Model) DimensionsCount() int
 DimensionsCount returns 1 for regression/binary classification, N for multiclass.
 
 <a name="Model.FloatFeaturesCount"></a>
-### func \(\*Model\) [FloatFeaturesCount](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L219>)
+### func \(\*Model\) [FloatFeaturesCount](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L222>)
 
 ```go
 func (m *Model) FloatFeaturesCount() int
@@ -127,7 +127,7 @@ func (m *Model) FloatFeaturesCount() int
 FloatFeaturesCount returns the number of float features the model expects.
 
 <a name="Model.InfoValue"></a>
-### func \(\*Model\) [InfoValue](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L229>)
+### func \(\*Model\) [InfoValue](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L232>)
 
 ```go
 func (m *Model) InfoValue(key string) (string, bool)
@@ -136,7 +136,7 @@ func (m *Model) InfoValue(key string) (string, bool)
 InfoValue returns model metainfo for the given key.
 
 <a name="Model.SetPredictionType"></a>
-### func \(\*Model\) [SetPredictionType](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L235>)
+### func \(\*Model\) [SetPredictionType](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L238>)
 
 ```go
 func (m *Model) SetPredictionType(pt PredictionType)
@@ -145,7 +145,7 @@ func (m *Model) SetPredictionType(pt PredictionType)
 SetPredictionType sets the prediction type. Default is RawFormulaVal.
 
 <a name="Model.SetProbabilityBorder"></a>
-### func \(\*Model\) [SetProbabilityBorder](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L241>)
+### func \(\*Model\) [SetProbabilityBorder](<https://github.com/maxpoletaev/go-catboost/blob/master/catboost.go#L244>)
 
 ```go
 func (m *Model) SetProbabilityBorder(p float64)
