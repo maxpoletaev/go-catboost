@@ -2,7 +2,7 @@
 
 Pure-Go zero-deps implementation of CatBoost model evaluation library.
 
-Check out [examples](examples).
+Check out [examples](examples) and [godoc.md](godoc.md).
 
 ## Status
 
