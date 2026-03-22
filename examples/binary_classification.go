@@ -8,7 +8,7 @@ import (
 )
 
 func runBinaryClassification() {
-	m, err := catboost.LoadFromFile("../testdata/float_binary.cbm")
+	m, err := catboost.LoadFromFile("../testdata/float_binary_model.json.gz")
 	if err != nil {
 		log.Fatalf("load model: %v", err)
 	}

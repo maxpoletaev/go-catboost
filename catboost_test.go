@@ -27,16 +27,12 @@ var fixtures = []string{
 	"large_features",
 	"extreme_values",
 	"mixed_multiclass",
-
-	// Non-symmetric trees (grow_policy=Lossguide / Depthwise)
 	"nonsym_regression",
 	"nonsym_binary",
 	"nonsym_multiclass",
+	"multiclass_class",
+	"ctr_binary",
 }
-
-// --------------------------------------------------------------------------
-// JSON fixture types
-// --------------------------------------------------------------------------
 
 type fixture struct {
 	Description       string      `json:"description"`
@@ -53,8 +49,6 @@ type sample struct {
 	Cats   []string        `json:"cats"`
 }
 
-// nullableFloat unmarshals a JSON number or null into a float32.
-// null becomes NaN (used to represent missing values).
 type nullableFloat struct{ v float32 }
 
 func (n *nullableFloat) UnmarshalJSON(b []byte) error {
@@ -71,10 +65,6 @@ func (n *nullableFloat) UnmarshalJSON(b []byte) error {
 	n.v = float32(f)
 	return nil
 }
-
-// --------------------------------------------------------------------------
-// Helpers
-// --------------------------------------------------------------------------
 
 func predictionTypeFromString(s string) (catboost.PredictionType, bool) {
 	switch s {
@@ -101,11 +91,12 @@ func toFloats(ns []nullableFloat) []float32 {
 	return out
 }
 
-// nearEqual reports whether a and b are equal within a small absolute tolerance.
+// nearEqual reports whether a and b are equal within a small relative tolerance.
 // Underlying math in Go and Python can diverge slightly for exp, sigmoid, or
-// softmax, so exact comparison is not possible for those prediction types.
+// softmax, and last-bit differences can arise across CPU architectures (arm64
+// vs amd64), so exact comparison is not possible for those prediction types.
 func nearEqual(a, b float64) bool {
-	const tolerance = 1e-14
+	const tolerance = 1e-13
 	if a == b {
 		return true
 	}
@@ -116,10 +107,10 @@ func nearEqual(a, b float64) bool {
 	return d <= tolerance
 }
 
-func loadFixture(t *testing.T, name string) (fixture, *catboost.Model) {
+func loadFixture(t testing.TB, name string) (fixture, *catboost.Model) {
 	t.Helper()
 
-	jsonData, err := os.ReadFile("testdata/" + name + ".json")
+	jsonData, err := os.ReadFile("testdata/" + name + "_test.json")
 	if err != nil {
 		t.Fatalf("reading fixture: %v", err)
 	}
@@ -129,7 +120,7 @@ func loadFixture(t *testing.T, name string) (fixture, *catboost.Model) {
 		t.Fatalf("parsing fixture: %v", err)
 	}
 
-	m, err := catboost.LoadFromFile("testdata/" + name + ".cbm")
+	m, err := catboost.LoadFromFile("testdata/" + name + "_model.json.gz")
 	if err != nil {
 		t.Fatalf("LoadFromFile: %v", err)
 	}
@@ -142,10 +133,6 @@ func loadFixture(t *testing.T, name string) (fixture, *catboost.Model) {
 
 	return fix, m
 }
-
-// --------------------------------------------------------------------------
-// Tests
-// --------------------------------------------------------------------------
 
 func TestMetadata(t *testing.T) {
 	for _, name := range fixtures {

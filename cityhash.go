@@ -16,6 +16,8 @@ const (
 	k3 uint64 = 0xc949d7c7509e6557
 )
 
+var le = binary.LittleEndian
+
 func rotateByAtLeast1(val uint64, shift int) uint64 {
 	return bits.RotateLeft64(val, -shift)
 }
@@ -42,14 +44,14 @@ func hashLen0to16(s []byte) uint64 {
 	length := len(s)
 
 	if length > 8 {
-		a := binary.LittleEndian.Uint64(s[0:8])
-		b := binary.LittleEndian.Uint64(s[length-8 : length])
+		a := le.Uint64(s[0:8])
+		b := le.Uint64(s[length-8 : length])
 		return hashLen16(a, rotateByAtLeast1(b+uint64(length), length)) ^ b
 	}
 
 	if length >= 4 {
-		a := uint64(binary.LittleEndian.Uint32(s[0:4]))
-		return hashLen16(uint64(length)+(a<<3), uint64(binary.LittleEndian.Uint32(s[length-4:length])))
+		a := uint64(le.Uint32(s[0:4]))
+		return hashLen16(uint64(length)+(a<<3), uint64(le.Uint32(s[length-4:length])))
 	}
 
 	if length > 0 {
@@ -66,10 +68,10 @@ func hashLen0to16(s []byte) uint64 {
 
 func hashLen17to32(s []byte) uint64 {
 	length := len(s)
-	a := binary.LittleEndian.Uint64(s[0:8]) * k1
-	b := binary.LittleEndian.Uint64(s[8:16])
-	c := binary.LittleEndian.Uint64(s[length-8:length]) * k2
-	d := binary.LittleEndian.Uint64(s[length-16:length-8]) * k0
+	a := le.Uint64(s[0:8]) * k1
+	b := le.Uint64(s[8:16])
+	c := le.Uint64(s[length-8:length]) * k2
+	d := le.Uint64(s[length-16:length-8]) * k0
 	return hashLen16(
 		bits.RotateLeft64(a-b, -43)+bits.RotateLeft64(c, -30)+d,
 		a+bits.RotateLeft64(b^k3, -20)-c+uint64(length),
@@ -78,23 +80,23 @@ func hashLen17to32(s []byte) uint64 {
 
 func hashLen33to64(s []byte) uint64 {
 	length := len(s)
-	z := binary.LittleEndian.Uint64(s[24:32])
-	a := binary.LittleEndian.Uint64(s[0:8]) + (uint64(length)+binary.LittleEndian.Uint64(s[length-16:length-8]))*k0
+	z := le.Uint64(s[24:32])
+	a := le.Uint64(s[0:8]) + (uint64(length)+le.Uint64(s[length-16:length-8]))*k0
 	b := bits.RotateLeft64(a+z, -52)
 	c := bits.RotateLeft64(a, -37)
-	a += binary.LittleEndian.Uint64(s[8:16])
+	a += le.Uint64(s[8:16])
 	c += bits.RotateLeft64(a, -7)
-	a += binary.LittleEndian.Uint64(s[16:24])
+	a += le.Uint64(s[16:24])
 	vf := a + z
 	vs := b + bits.RotateLeft64(a, -31) + c
 
-	a = binary.LittleEndian.Uint64(s[16:24]) + binary.LittleEndian.Uint64(s[length-32:length-24])
-	z = binary.LittleEndian.Uint64(s[length-8 : length])
+	a = le.Uint64(s[16:24]) + le.Uint64(s[length-32:length-24])
+	z = le.Uint64(s[length-8 : length])
 	b = bits.RotateLeft64(a+z, -52)
 	c = bits.RotateLeft64(a, -37)
-	a += binary.LittleEndian.Uint64(s[length-24 : length-16])
+	a += le.Uint64(s[length-24 : length-16])
 	c += bits.RotateLeft64(a, -7)
-	a += binary.LittleEndian.Uint64(s[length-16 : length-8])
+	a += le.Uint64(s[length-16 : length-8])
 	wf := a + z
 	ws := b + bits.RotateLeft64(a, -31) + c
 
@@ -118,16 +120,15 @@ func weakHashLen32WithSeeds(w, x, y, z, a, b uint64) uint64Pair {
 
 func weakHashLen32WithSeedsBytes(s []byte, a, b uint64) uint64Pair {
 	return weakHashLen32WithSeeds(
-		binary.LittleEndian.Uint64(s[0:8]),
-		binary.LittleEndian.Uint64(s[8:16]),
-		binary.LittleEndian.Uint64(s[16:24]),
-		binary.LittleEndian.Uint64(s[24:32]),
+		le.Uint64(s[0:8]),
+		le.Uint64(s[8:16]),
+		le.Uint64(s[16:24]),
+		le.Uint64(s[24:32]),
 		a,
 		b,
 	)
 }
 
-// Ref: catboost/util/digest/city.cpp (CityHash64)
 func cityHash64(s []byte) uint64 {
 	length := len(s)
 
@@ -140,9 +141,9 @@ func cityHash64(s []byte) uint64 {
 	}
 
 	// For strings > 64 bytes.
-	x := binary.LittleEndian.Uint64(s[0:8])
-	y := binary.LittleEndian.Uint64(s[length-16:length-8]) ^ k1
-	z := binary.LittleEndian.Uint64(s[length-56:length-48]) ^ k0
+	x := le.Uint64(s[0:8])
+	y := le.Uint64(s[length-16:length-8]) ^ k1
+	z := le.Uint64(s[length-56:length-48]) ^ k0
 	v := weakHashLen32WithSeedsBytes(s[length-64:length-32], uint64(length), y)
 	w := weakHashLen32WithSeedsBytes(s[length-32:length], uint64(length)*k1, k0)
 	z += shiftMix(v.second) * k1
@@ -151,8 +152,8 @@ func cityHash64(s []byte) uint64 {
 
 	length = (length - 1) & ^int(63)
 	for length > 0 {
-		x = bits.RotateLeft64(x+y+v.first+binary.LittleEndian.Uint64(s[16:24]), -37) * k1
-		y = bits.RotateLeft64(y+v.second+binary.LittleEndian.Uint64(s[48:56]), -42) * k1
+		x = bits.RotateLeft64(x+y+v.first+le.Uint64(s[16:24]), -37) * k1
+		y = bits.RotateLeft64(y+v.second+le.Uint64(s[48:56]), -42) * k1
 		x ^= w.second
 		y ^= v.first
 		z = bits.RotateLeft64(z^w.first, -33)

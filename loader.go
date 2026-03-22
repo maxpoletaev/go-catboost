@@ -1,213 +1,204 @@
 package catboost
 
 import (
+	"encoding/json"
 	"fmt"
-	"math"
-
-	"github.com/maxpoletaev/go-catboost/internal/cbm"
+	"strconv"
 )
 
-// deserializeModel loads a Model from FlatBuffers
-// Ref: catboost/libs/model/model.cpp
-func deserializeModel(fbTrees *cbm.TModelTrees) (*Model, error) {
-	approxDimension := int(fbTrees.ApproxDimension())
+type jsonModelFile struct {
+	FeaturesInfo   jsonFeaturesInfo         `json:"features_info"`
+	ObliviousTrees []jsonOblTree            `json:"oblivious_trees"`
+	Trees          []json.RawMessage        `json:"trees"`
+	ScaleAndBias   jsonScaleBias            `json:"scale_and_bias"`
+	CtrData        map[string]*jsonCtrTable `json:"ctr_data"`
+}
+
+type jsonFeaturesInfo struct {
+	FloatFeatures []jsonFloatFeature `json:"float_features"`
+	CatFeatures   []jsonCatFeature   `json:"categorical_features"`
+	CtrFeatures   []jsonCtrFeature   `json:"ctrs"`
+}
+
+type jsonCtrFeature struct {
+	Identifier      string            `json:"identifier"`
+	Elements        []jsonCombElement `json:"elements"`
+	CtrType         string            `json:"ctr_type"`
+	PriorNum        float64           `json:"prior_numerator"`
+	PriorDenom      float64           `json:"prior_denomerator"` // typo in CatBoost source
+	Shift           float64           `json:"shift"`
+	Scale           float64           `json:"scale"`
+	TargetBorderIdx int               `json:"target_border_idx"`
+	Borders         []float32         `json:"borders"`
+}
+
+type jsonCombElement struct {
+	CombElement     string  `json:"combination_element"`
+	CatFeatureIndex int     `json:"cat_feature_index"`   // cat_feature_value, cat_feature_exact_value
+	FloatFeatIndex  int     `json:"float_feature_index"` // float_feature
+	Border          float32 `json:"border"`              // float_feature
+	Value           int32   `json:"value"`               // cat_feature_exact_value
+}
+
+type jsonCtrTable struct {
+	HashMap            []json.RawMessage `json:"hash_map"`
+	HashStride         int               `json:"hash_stride"`
+	CounterDenominator int32             `json:"counter_denominator"`
+}
+
+type jsonFloatFeature struct {
+	FeatureIndex int       `json:"feature_index"`
+	Borders      []float32 `json:"borders"`
+	NanTreatment string    `json:"nan_value_treatment"`
+}
+
+type jsonCatFeature struct {
+	FeatureIndex int     `json:"feature_index"`
+	Values       []int32 `json:"values"` // non-empty for one-hot features
+}
+
+type jsonOblTree struct {
+	Splits     []jsonSplit `json:"splits"`
+	LeafValues []float64   `json:"leaf_values"`
+}
+
+type jsonSplit struct {
+	SplitType    string  `json:"split_type"`
+	FloatFeatIdx int     `json:"float_feature_index"`
+	Border       float32 `json:"border"`
+	CatFeatIdx   int     `json:"cat_feature_index"`
+	Value        int32   `json:"value"`
+	SplitIndex   int     `json:"split_index"`
+}
+
+type jsonScaleBias struct {
+	Scale float64
+	Bias  []float64
+}
+
+func (sb *jsonScaleBias) UnmarshalJSON(data []byte) error {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if len(raw) != 2 {
+		return fmt.Errorf("scale_and_bias: expected 2 elements, got %d", len(raw))
+	}
+	if err := json.Unmarshal(raw[0], &sb.Scale); err != nil {
+		return fmt.Errorf("scale_and_bias: scale: %w", err)
+	}
+	return json.Unmarshal(raw[1], &sb.Bias)
+}
+
+func buildModel(jm *jsonModelFile) (*Model, error) {
+	approxDimension := len(jm.ScaleAndBias.Bias)
 	if approxDimension < 1 {
 		approxDimension = 1
 	}
 
-	floatFeatures := deserializeFloatFeatures(fbTrees)
-	catFeatures := deserializeCatFeatures(fbTrees)
-
-	oneHotFeatures, err := deserializeOneHotFeatures(fbTrees, catFeatures)
+	// Build CTR features and a split-index-to-CTR-index mapping.
+	ctrFeats, splitIdxToCTR, err := buildCtrFeatures(jm)
 	if err != nil {
 		return nil, err
 	}
 
-	treeSizes, treeStartOffsets, repackedBins := deserializeTreeSplits(fbTrees)
-	stepNodes, nodeIdToLeafId := deserializeStepNodes(fbTrees)
-	leafValues := deserializeLeafValues(fbTrees)
-	scale, bias := deserializeScaleBias(fbTrees, approxDimension)
+	var (
+		treeSizes        []int
+		treeStartOffsets []int
+		splits           []treeSplit
+		leafValues       []float64
+		stepNodes        []stepNode
+		nodeIdToLeafId   []uint32
+	)
 
-	m := &Model{
-		approxDimension:  approxDimension,
-		floatFeatures:    floatFeatures,
-		catFeatures:      catFeatures,
-		oneHotFeatures:   oneHotFeatures,
-		treeSizes:        treeSizes,
-		treeStartOffsets: treeStartOffsets,
-		repackedBins:     repackedBins,
-		leafValues:       leafValues,
-		stepNodes:        stepNodes,
-		nodeIdToLeafId:   nodeIdToLeafId,
-		scale:            scale,
-		bias:             bias,
-		modelInfo:        make(map[string]string),
+	if len(jm.ObliviousTrees) > 0 {
+		for _, tree := range jm.ObliviousTrees {
+			treeStartOffsets = append(treeStartOffsets, len(splits))
+			treeSizes = append(treeSizes, len(tree.Splits))
+
+			for _, s := range tree.Splits {
+				sp, err := convertSplit(s, jm.FeaturesInfo, splitIdxToCTR)
+				if err != nil {
+					return nil, err
+				}
+				splits = append(splits, sp)
+			}
+
+			leafValues = append(leafValues, tree.LeafValues...)
+		}
+	} else {
+		b := &treeBuilder{featuresInfo: jm.FeaturesInfo, splitIdxToCtr: splitIdxToCTR}
+		for _, rawTree := range jm.Trees {
+			var root jsonTreeNode
+			if err := json.Unmarshal(rawTree, &root); err != nil {
+				return nil, fmt.Errorf("parsing tree: %w", err)
+			}
+
+			treeStartOffsets = append(treeStartOffsets, len(b.splits))
+			size, err := b.flatten(&root)
+			if err != nil {
+				return nil, err
+			}
+
+			treeSizes = append(treeSizes, size)
+		}
+
+		splits = b.splits
+		stepNodes = b.stepNodes
+		nodeIdToLeafId = b.nodeIdToLeafId
+		leafValues = b.leafValues
 	}
 
-	m.updateRuntimeData()
+	scale := jm.ScaleAndBias.Scale
+	if scale == 0 {
+		scale = 1.0
+	}
+	bias := jm.ScaleAndBias.Bias
+	if len(bias) == 0 {
+		bias = make([]float64, approxDimension)
+	}
+
+	// Compute minimum required feature slice lengths from the feature descriptors.
+	minFloat, minCat := 0, 0
+	for _, ff := range jm.FeaturesInfo.FloatFeatures {
+		if ff.FeatureIndex+1 > minFloat {
+			minFloat = ff.FeatureIndex + 1
+		}
+	}
+	for _, cf := range jm.FeaturesInfo.CatFeatures {
+		if cf.FeatureIndex+1 > minCat {
+			minCat = cf.FeatureIndex + 1
+		}
+	}
+
+	isOblivious := len(stepNodes) == 0
+	var treeFirstLeafOffset []int
+	if isOblivious {
+		treeFirstLeafOffset = calcObliviousLeafOffsets(treeSizes, approxDimension)
+	}
+
+	m := &Model{
+		approxDimension:     approxDimension,
+		treeSizes:           treeSizes,
+		treeStartOffsets:    treeStartOffsets,
+		splits:              splits,
+		leafValues:          leafValues,
+		stepNodes:           stepNodes,
+		nodeIdToLeafId:      nodeIdToLeafId,
+		scale:               scale,
+		bias:                bias,
+		floatFeatureCount:   minFloat,
+		catFeatureCount:     minCat,
+		modelInfo:           make(map[string]string),
+		ctrFeatures:         ctrFeats,
+		isOblivious:         isOblivious,
+		treeFirstLeafOffset: treeFirstLeafOffset,
+	}
 
 	return m, nil
 }
 
-// updateRuntimeData computes fields derived from the raw deserialized data.
-// Ref: catboost/libs/model/model.cpp (UpdateRuntimeData)
-func (m *Model) updateRuntimeData() {
-	m.isOblivious = len(m.stepNodes) == 0
-	m.needXorMask = len(m.oneHotFeatures) > 0
-	if m.isOblivious {
-		m.treeFirstLeafOffset = calcObliviousFirstLeafOffsets(m.treeSizes, m.approxDimension)
-	} else {
-		m.treeFirstLeafOffset = calcNonSymmetricFirstLeafOffsets(
-			m.treeSizes, m.treeStartOffsets, m.stepNodes, m.nodeIdToLeafId, m.approxDimension,
-		)
-	}
-	m.effectiveBinCount = computeEffectiveBinCount(m.floatFeatures, m.oneHotFeatures)
-
-	// Ref: catboost/libs/model/model.cpp (UpdateApplyData)
-	// MinimalSufficientFloatFeaturesVectorSize = max(Position.Index) + 1
-	for _, ff := range m.floatFeatures {
-		if ff.index+1 > m.minFloatFeatures {
-			m.minFloatFeatures = ff.index + 1
-		}
-	}
-	for _, cf := range m.catFeatures {
-		if cf.index+1 > m.minCatFeatures {
-			m.minCatFeatures = cf.index + 1
-		}
-	}
-}
-
-func deserializeFloatFeatures(fbTrees *cbm.TModelTrees) []floatFeatureMeta {
-	features := make([]floatFeatureMeta, fbTrees.FloatFeaturesLength())
-	for i := range features {
-		var ff cbm.TFloatFeature
-		fbTrees.FloatFeatures(&ff, i)
-		borders := make([]float32, ff.BordersLength())
-		for j := range borders {
-			borders[j] = ff.Borders(j)
-		}
-		features[i] = floatFeatureMeta{
-			index:   int(ff.Index()),
-			borders: borders,
-			nanMode: nanValueTreatment(ff.NanValueTreatment()),
-		}
-	}
-	return features
-}
-
-func deserializeCatFeatures(fbTrees *cbm.TModelTrees) []catFeatureMeta {
-	var features []catFeatureMeta
-	for i := 0; i < fbTrees.CatFeaturesLength(); i++ {
-		var cf cbm.TCatFeature
-		fbTrees.CatFeatures(&cf, i)
-		if !cf.UsedInModel() {
-			continue
-		}
-		features = append(features, catFeatureMeta{index: int(cf.Index())})
-	}
-	return features
-}
-
-func deserializeOneHotFeatures(fbTrees *cbm.TModelTrees, catFeatures []catFeatureMeta) ([]oneHotFeatureMeta, error) {
-	features := make([]oneHotFeatureMeta, fbTrees.OneHotFeaturesLength())
-	for i := range features {
-		var ohe cbm.TOneHotFeature
-		fbTrees.OneHotFeatures(&ohe, i)
-
-		// Find the packed index of the referenced cat feature.
-		catIdx := int(ohe.Index())
-		packedIdx := -1
-		for j, cf := range catFeatures {
-			if cf.index == catIdx {
-				packedIdx = j
-				break
-			}
-		}
-		if packedIdx < 0 {
-			return nil, fmt.Errorf("one-hot feature references cat feature %d which is not used in model", catIdx)
-		}
-
-		values := make([]int32, ohe.ValuesLength())
-		for j := range values {
-			values[j] = ohe.Values(j)
-		}
-		features[i] = oneHotFeatureMeta{catFeatureIndex: packedIdx, values: values}
-	}
-	return features, nil
-}
-
-func deserializeTreeSplits(fbTrees *cbm.TModelTrees) ([]int, []int, []repackedBin) {
-	nTrees := fbTrees.TreeSizesLength()
-	treeSizes := make([]int, nTrees)
-	treeStartOffsets := make([]int, nTrees)
-	for i := range treeSizes {
-		treeSizes[i] = int(fbTrees.TreeSizes(i))
-		treeStartOffsets[i] = int(fbTrees.TreeStartOffsets(i))
-	}
-
-	bins := make([]repackedBin, fbTrees.RepackedBinsLength())
-	var rb cbm.TRepackedBin
-	for i := range bins {
-		fbTrees.RepackedBins(&rb, i)
-		bins[i] = repackedBin{
-			featureIndex: rb.FeatureIndex(),
-			xorMask:      rb.XorMask(),
-			splitIdx:     rb.SplitIdx(),
-		}
-	}
-	return treeSizes, treeStartOffsets, bins
-}
-
-func deserializeStepNodes(fbTrees *cbm.TModelTrees) ([]stepNode, []uint32) {
-	nodes := make([]stepNode, fbTrees.NonSymmetricStepNodesLength())
-	var sn cbm.TNonSymmetricTreeStepNode
-	for i := range nodes {
-		fbTrees.NonSymmetricStepNodes(&sn, i)
-		nodes[i] = stepNode{
-			leftDiff:  sn.LeftSubtreeDiff(),
-			rightDiff: sn.RightSubtreeDiff(),
-		}
-	}
-
-	nodeIdToLeafId := make([]uint32, fbTrees.NonSymmetricNodeIdToLeafIdLength())
-	for i := range nodeIdToLeafId {
-		nodeIdToLeafId[i] = fbTrees.NonSymmetricNodeIdToLeafId(i)
-	}
-	return nodes, nodeIdToLeafId
-}
-
-func deserializeLeafValues(fbTrees *cbm.TModelTrees) []float64 {
-	leafValues := make([]float64, fbTrees.LeafValuesLength())
-	for i := range leafValues {
-		leafValues[i] = fbTrees.LeafValues(i)
-	}
-	return leafValues
-}
-
-func deserializeScaleBias(fbTrees *cbm.TModelTrees, approxDimension int) (float64, []float64) {
-	scale := fbTrees.Scale()
-	if scale == 0 {
-		scale = 1.0 // default in schema
-	}
-
-	var bias []float64
-	if fbTrees.MultiBiasLength() > 0 {
-		bias = make([]float64, fbTrees.MultiBiasLength())
-		for i := range bias {
-			bias[i] = fbTrees.MultiBias(i)
-		}
-	} else {
-		bias = make([]float64, approxDimension)
-		b := fbTrees.Bias()
-		for i := range bias {
-			bias[i] = b
-		}
-	}
-	return scale, bias
-}
-
-// Ref: catboost/libs/model/model.cpp (CalcFirstLeafOffsets)
-func calcObliviousFirstLeafOffsets(treeSizes []int, approxDimension int) []int {
+func calcObliviousLeafOffsets(treeSizes []int, approxDimension int) []int {
 	offsets := make([]int, len(treeSizes))
 	offset := 0
 	for i, size := range treeSizes {
@@ -217,53 +208,261 @@ func calcObliviousFirstLeafOffsets(treeSizes []int, approxDimension int) []int {
 	return offsets
 }
 
-// Ref: catboost/libs/model/model.cpp (CalcFirstLeafOffsets, non-symmetric branch)
-func calcNonSymmetricFirstLeafOffsets(
-	treeSizes []int,
-	treeStartOffsets []int,
-	stepNodes []stepNode,
-	nodeIdToLeafId []uint32,
-	approxDimension int,
-) []int {
-	offsets := make([]int, len(treeSizes))
-	for treeId, size := range treeSizes {
-		start := treeStartOffsets[treeId]
-		end := start + size
-		minIdx := ^uint32(0)
-		for nodeIdx := start; nodeIdx < end; nodeIdx++ {
-			sn := stepNodes[nodeIdx]
-			if sn.leftDiff == 0 || sn.rightDiff == 0 {
-				leafIdx := nodeIdToLeafId[nodeIdx]
-				if leafIdx < minIdx {
-					minIdx = leafIdx
-				}
+type jsonTreeNode struct {
+	Split  *jsonSplit      `json:"split"`
+	Left   *jsonTreeNode   `json:"left"`
+	Right  *jsonTreeNode   `json:"right"`
+	Value  json.RawMessage `json:"value"`
+	Weight float64         `json:"weight"`
+}
+
+type treeBuilder struct {
+	splits         []treeSplit
+	stepNodes      []stepNode
+	nodeIdToLeafId []uint32
+	leafValues     []float64
+	featuresInfo   jsonFeaturesInfo
+	splitIdxToCtr  map[int]int
+}
+
+func (b *treeBuilder) flatten(node *jsonTreeNode) (int, error) {
+	myIdx := len(b.splits)
+
+	if node.Split == nil {
+		// Leaf node
+		b.splits = append(b.splits, treeSplit{})
+		b.stepNodes = append(b.stepNodes, stepNode{0, 0})
+		b.nodeIdToLeafId = append(b.nodeIdToLeafId, uint32(len(b.leafValues)))
+
+		var vals []float64
+		if err := json.Unmarshal(node.Value, &vals); err != nil {
+			// scalar (regression / binary)
+			var v float64
+			if err2 := json.Unmarshal(node.Value, &v); err2 != nil {
+				return 0, fmt.Errorf("parsing leaf value: %w", err2)
 			}
+			vals = []float64{v}
 		}
-		offsets[treeId] = int(minIdx)
+		b.leafValues = append(b.leafValues, vals...)
+		return 1, nil
 	}
-	return offsets
+
+	sp, err := convertSplit(*node.Split, b.featuresInfo, b.splitIdxToCtr)
+	if err != nil {
+		return 0, err
+	}
+
+	b.splits = append(b.splits, sp)
+	b.stepNodes = append(b.stepNodes, stepNode{}) // filled after recursion
+	b.nodeIdToLeafId = append(b.nodeIdToLeafId, 0)
+
+	leftSize, err := b.flatten(node.Left)
+	if err != nil {
+		return 0, err
+	}
+	rightSize, err := b.flatten(node.Right)
+	if err != nil {
+		return 0, err
+	}
+
+	b.stepNodes[myIdx] = stepNode{leftDiff: 1, rightDiff: uint16(1 + leftSize)}
+	return 1 + leftSize + rightSize, nil
 }
 
-// Ref: catboost/libs/model/model.cpp (CalcBinFeatures)
-func computeEffectiveBinCount(floatFeatures []floatFeatureMeta, oneHotFeatures []oneHotFeatureMeta) int {
-	count := 0
-	for i := range floatFeatures {
-		count += (len(floatFeatures[i].borders) + maxValuesPerBin - 1) / maxValuesPerBin
-	}
-	for i := range oneHotFeatures {
-		count += (len(oneHotFeatures[i].values) + maxValuesPerBin - 1) / maxValuesPerBin
-	}
-	return count
-}
+func convertSplit(s jsonSplit, fi jsonFeaturesInfo, splitIdxToCtr map[int]int) (treeSplit, error) {
+	switch s.SplitType {
+	case "FloatFeature":
+		idx := s.FloatFeatIdx
+		if idx < 0 || idx >= len(fi.FloatFeatures) {
+			return treeSplit{}, fmt.Errorf("float_feature_index %d out of range", idx)
+		}
+		ff := fi.FloatFeatures[idx]
+		return treeSplit{
+			kind:         splitKindFloat,
+			featureIndex: ff.FeatureIndex,
+			border:       s.Border,
+			nanMode:      parseNanTreatment(ff.NanTreatment),
+		}, nil
 
-// Ref: catboost/libs/model/cpu/quantization.h (BinarizeFeatures, NaN branch)
-func nanSubstitution(mode nanValueTreatment) (float32, bool) {
-	switch mode {
-	case nanAsFalse:
-		return float32(math.Inf(-1)), true
-	case nanAsTrue:
-		return float32(math.Inf(1)), true
+	case "OneHotFeature":
+		idx := s.CatFeatIdx
+		if idx < 0 || idx >= len(fi.CatFeatures) {
+			return treeSplit{}, fmt.Errorf("cat_feature_index %d out of range", idx)
+		}
+		return treeSplit{
+			kind:         splitKindOneHot,
+			featureIndex: fi.CatFeatures[idx].FeatureIndex,
+			hashValue:    s.Value,
+		}, nil
+
+	case "OnlineCtr":
+		ctrIdx, ok := splitIdxToCtr[s.SplitIndex]
+		if !ok {
+			return treeSplit{}, fmt.Errorf("OnlineCtr split_index %d not in CTR range", s.SplitIndex)
+		}
+		return treeSplit{
+			kind:   splitKindCTR,
+			ctrIdx: ctrIdx,
+			border: s.Border,
+		}, nil
+
 	default:
-		return 0, false
+		return treeSplit{}, fmt.Errorf("unsupported split type %q", s.SplitType)
 	}
+}
+
+func parseCtrType(s string) (ctrType, error) {
+	switch s {
+	case "Borders", "BinarizedTargetMeanValue", "FloatTargetMeanValue":
+		return ctrTypeBorders, nil
+	case "Buckets":
+		return ctrTypeBuckets, nil
+	case "Counter":
+		return ctrTypeCounter, nil
+	case "FeatureFreq":
+		return ctrTypeFeqFreq, nil
+	default:
+		return 0, fmt.Errorf("unknown CTR type %q", s)
+	}
+}
+
+func parseNanTreatment(s string) nanMode {
+	switch s {
+	case "AsFalse":
+		return nanAsFalse
+	case "AsTrue":
+		return nanAsTrue
+	default:
+		return nanAsIs
+	}
+}
+
+func buildCtrFeatures(jm *jsonModelFile) ([]ctrFeature, map[int]int, error) {
+	if len(jm.FeaturesInfo.CtrFeatures) == 0 {
+		return nil, nil, nil
+	}
+
+	// Count how many binary feature slots come before CTR features.
+	ctrSplitStart := 0
+	for _, ff := range jm.FeaturesInfo.FloatFeatures {
+		ctrSplitStart += len(ff.Borders)
+	}
+	for _, cf := range jm.FeaturesInfo.CatFeatures {
+		ctrSplitStart += len(cf.Values)
+	}
+
+	// Build per-identifier CTR value tables from ctr_data.
+	tables := make(map[string]*ctrValueTable, len(jm.CtrData))
+	for identifier, jt := range jm.CtrData {
+		tbl, err := parseCtrTable(jt)
+		if err != nil {
+			return nil, nil, fmt.Errorf("CTR table %q: %w", identifier, err)
+		}
+		tables[identifier] = tbl
+	}
+
+	feats := make([]ctrFeature, 0, len(jm.FeaturesInfo.CtrFeatures))
+	splitIdxToCtr := make(map[int]int)
+	offset := ctrSplitStart
+
+	for _, jcf := range jm.FeaturesInfo.CtrFeatures {
+		tbl, ok := tables[jcf.Identifier]
+		if !ok {
+			return nil, nil, fmt.Errorf("ctr_data missing entry for identifier %q", jcf.Identifier)
+		}
+
+		proj, err := parseCtrProjection(jcf.Elements)
+		if err != nil {
+			return nil, nil, fmt.Errorf("CTR feature %q: %w", jcf.Identifier, err)
+		}
+		ct, err := parseCtrType(jcf.CtrType)
+		if err != nil {
+			return nil, nil, fmt.Errorf("CTR feature %q: %w", jcf.Identifier, err)
+		}
+
+		if ct != ctrTypeCounter && ct != ctrTypeFeqFreq && jcf.TargetBorderIdx >= tbl.stride {
+			return nil, nil, fmt.Errorf("CTR %q: targetBorderIdx %d out of range [0, %d)", jcf.Identifier, jcf.TargetBorderIdx, tbl.stride)
+		}
+
+		ctrIdx := len(feats)
+		feats = append(feats, ctrFeature{
+			projection:      proj,
+			ctrType:         ct,
+			targetBorderIdx: jcf.TargetBorderIdx,
+			priorNum:        jcf.PriorNum,
+			priorDenom:      jcf.PriorDenom,
+			scale:           jcf.Scale,
+			shift:           jcf.Shift,
+			table:           tbl,
+		})
+
+		for range jcf.Borders {
+			splitIdxToCtr[offset] = ctrIdx
+			offset++
+		}
+	}
+
+	return feats, splitIdxToCtr, nil
+}
+
+func parseCtrProjection(elements []jsonCombElement) ([]ctrProjElem, error) {
+	proj := make([]ctrProjElem, 0, len(elements))
+	for _, elem := range elements {
+		switch elem.CombElement {
+		case "cat_feature_value":
+			proj = append(proj, ctrProjElem{elemType: ctrElemCat, catIdx: elem.CatFeatureIndex})
+		case "float_feature":
+			proj = append(proj, ctrProjElem{elemType: ctrElemFloat, floatIdx: elem.FloatFeatIndex, border: elem.Border})
+		case "cat_feature_exact_value":
+			proj = append(proj, ctrProjElem{elemType: ctrElemExactCat, catIdx: elem.CatFeatureIndex, hashValue: elem.Value})
+		default:
+			return nil, fmt.Errorf("unsupported combination element type %q", elem.CombElement)
+		}
+	}
+	return proj, nil
+}
+
+func parseCtrTable(jt *jsonCtrTable) (*ctrValueTable, error) {
+	stride := jt.HashStride - 1 // data values per bucket
+	if jt.HashStride < 1 {
+		return nil, fmt.Errorf("invalid hash_stride %d", jt.HashStride)
+	}
+	if len(jt.HashMap)%jt.HashStride != 0 {
+		return nil, fmt.Errorf("hash_map length %d not divisible by hash_stride %d", len(jt.HashMap), jt.HashStride)
+	}
+
+	n := len(jt.HashMap) / jt.HashStride
+	lookup := make(map[uint64]int, n)
+	data := make([]int32, n*stride)
+
+	for i := 0; i < len(jt.HashMap); i += jt.HashStride {
+		rowIdx := i / jt.HashStride
+
+		var hashStr string
+		if err := json.Unmarshal(jt.HashMap[i], &hashStr); err != nil {
+			return nil, fmt.Errorf("hash key at position %d: %w", i, err)
+		}
+
+		h, err := strconv.ParseUint(hashStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parsing hash %q: %w", hashStr, err)
+		}
+
+		lookup[h] = rowIdx
+
+		for j := 0; j < stride; j++ {
+			var v int32
+			if err := json.Unmarshal(jt.HashMap[i+1+j], &v); err != nil {
+				return nil, fmt.Errorf("hash_map data at position %d: %w", i+1+j, err)
+			}
+			data[rowIdx*stride+j] = v
+		}
+	}
+
+	return &ctrValueTable{
+		lookup:       lookup,
+		data:         data,
+		stride:       stride,
+		counterDenom: jt.CounterDenominator,
+	}, nil
 }

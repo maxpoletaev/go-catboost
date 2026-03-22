@@ -9,7 +9,7 @@ import (
 )
 
 func runRegression() {
-	m, err := catboost.LoadFromFile("../testdata/float_regression.cbm")
+	m, err := catboost.LoadFromFile("../testdata/float_regression_model.json.gz")
 	if err != nil {
 		log.Fatalf("load model: %v", err)
 	}

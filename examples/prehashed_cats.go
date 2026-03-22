@@ -8,7 +8,7 @@ import (
 )
 
 func runPrehashedCats() {
-	m, err := catboost.LoadFromFile("../testdata/cat_onehot_small.cbm")
+	m, err := catboost.LoadFromFile("../testdata/cat_onehot_small_model.json.gz")
 	if err != nil {
 		log.Fatalf("load model: %v", err)
 	}

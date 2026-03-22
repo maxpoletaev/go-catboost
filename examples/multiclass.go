@@ -8,7 +8,7 @@ import (
 )
 
 func runMulticlass() {
-	m, err := catboost.LoadFromFile("../testdata/multiclass_3.cbm")
+	m, err := catboost.LoadFromFile("../testdata/multiclass_3_model.json.gz")
 	if err != nil {
 		log.Fatalf("load model: %v", err)
 	}

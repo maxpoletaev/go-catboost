@@ -1,17 +1,14 @@
 package catboost
 
 import (
-	"encoding/binary"
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
-
-	"github.com/maxpoletaev/go-catboost/internal/cbm"
-)
-
-const (
-	cbmMagic        = "CBM1"
-	formatVersion   = "FlabuffersModel_v1"
-	maxValuesPerBin = 254
+	"unsafe"
 )
 
 type PredictionType int
@@ -24,33 +21,29 @@ const (
 	PredictionTypeLogProbability
 )
 
-type nanValueTreatment int8
+type nanMode int8
 
 const (
-	nanAsIs    nanValueTreatment = 0
-	nanAsFalse nanValueTreatment = 1
-	nanAsTrue  nanValueTreatment = 2
+	nanAsIs    nanMode = 0
+	nanAsFalse nanMode = 1
+	nanAsTrue  nanMode = 2
 )
 
-type floatFeatureMeta struct {
-	index   int // position in the caller's float feature slice
-	borders []float32
-	nanMode nanValueTreatment
-}
+type splitKind int8
 
-type catFeatureMeta struct {
-	index int // position in the caller's cat feature slice
-}
+const (
+	splitKindFloat  splitKind = iota // float threshold on floatVals[featureIndex]
+	splitKindOneHot                  // equality check: catHashes[featureIndex] == hashValue
+	splitKindCTR                     // CTR value threshold: computeCTR(ctrIdx) > border
+)
 
-type oneHotFeatureMeta struct {
-	catFeatureIndex int // packed index among used cat features
-	values          []int32
-}
-
-type repackedBin struct {
-	featureIndex uint16
-	xorMask      byte
-	splitIdx     byte
+type treeSplit struct {
+	featureIndex int
+	border       float32
+	hashValue    int32
+	nanMode      nanMode
+	kind         splitKind
+	ctrIdx       int
 }
 
 type stepNode struct {
@@ -58,20 +51,14 @@ type stepNode struct {
 	rightDiff uint16
 }
 
-// Model holds a deserialized CatBoost model.
+// Model holds a deserialized CatBoost model ready for inference.
 type Model struct {
 	approxDimension int
 	predictionType  PredictionType
 
-	floatFeatures  []floatFeatureMeta
-	catFeatures    []catFeatureMeta
-	oneHotFeatures []oneHotFeatureMeta
-	needXorMask    bool
-
-	treeSizes        []int
-	treeStartOffsets []int
-	repackedBins     []repackedBin
-
+	treeSizes           []int
+	treeStartOffsets    []int
+	splits              []treeSplit
 	leafValues          []float64
 	treeFirstLeafOffset []int
 
@@ -79,231 +66,197 @@ type Model struct {
 	nodeIdToLeafId []uint32
 	isOblivious    bool
 
-	scale             float64
-	bias              []float64
-	effectiveBinCount int
+	scale                float64
+	bias                 []float64
+	binclassRawValBorder float64
 
-	minFloatFeatures int
-	minCatFeatures   int
+	floatFeatureCount int
+	catFeatureCount   int
+	modelInfo        map[string]string
+	ctrFeatures      []ctrFeature
 
-	modelInfo map[string]string
 }
 
-// LoadFromFile loads a model from a .cbm file.
+func nanSubstitution(mode nanMode) (float32, bool) {
+	switch mode {
+	case nanAsFalse:
+		return float32(math.Inf(-1)), true
+	case nanAsTrue:
+		return float32(math.Inf(1)), true
+	default:
+		return 0, false
+	}
+}
+
 func LoadFromFile(path string) (*Model, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading model file: %w", err)
 	}
-	return LoadFromBuffer(data)
+	defer f.Close()
+	return LoadFromReader(f)
 }
 
-// LoadFromBuffer loads a model from an in-memory buffer.
-func LoadFromBuffer(data []byte) (*Model, error) {
-	if len(data) < 8 {
-		return nil, fmt.Errorf("model data too short")
+func LoadFromReader(r io.Reader) (*Model, error) {
+	var jm jsonModelFile
+
+	var magic [2]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
+		return nil, fmt.Errorf("reading model: %w", err)
 	}
 
-	// Verify magic bytes "CBM1".
-	if string(data[:4]) != cbmMagic {
-		return nil, fmt.Errorf("invalid model magic bytes, expected %q", cbmMagic)
-	}
-
-	// Read the FlatBuffers core size (little-endian uint32 at offset 4).
-	coreSize := binary.LittleEndian.Uint32(data[4:8])
-
-	// Handle large models: if coreSize == 0xffffffff, the actual size is in the
-	// next 8 bytes as a uint64 (matching the C++ LoadSize logic).
-	offset := 8
-	var fbSize int
-	if coreSize == 0xffffffff {
-		if len(data) < 16 {
-			return nil, fmt.Errorf("model data too short for extended size")
+	r = io.MultiReader(bytes.NewReader(magic[:]), r)
+	if magic == [2]byte{0x1f, 0x8b} {
+		gzReader, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, fmt.Errorf("opening gzip model: %w", err)
 		}
-		fbSize = int(binary.LittleEndian.Uint64(data[8:16]))
-		offset = 16
-	} else {
-		fbSize = int(coreSize)
+		defer gzReader.Close()
+		r = gzReader
 	}
 
-	if offset+fbSize > len(data) {
-		return nil, fmt.Errorf("model data truncated: need %d bytes, have %d", offset+fbSize, len(data))
+	decoder := json.NewDecoder(r)
+	if err := decoder.Decode(&jm); err != nil {
+		return nil, fmt.Errorf("parsing JSON model: %w", err)
 	}
 
-	fbData := data[offset : offset+fbSize]
-
-	// Verify FlatBuffers identifier, flatc sets it to "CBMC".
-	// We use GetRootAsTModelCore which doesn't verify, so parse manually.
-	core := cbm.GetRootAsTModelCore(fbData, 0)
-
-	if string(core.FormatVersion()) != formatVersion {
-		return nil, fmt.Errorf("unsupported format version %q (expected %q)",
-			core.FormatVersion(), formatVersion)
-	}
-
-	var fbTrees cbm.TModelTrees
-	if core.ModelTrees(&fbTrees) == nil {
-		return nil, fmt.Errorf("model has no trees")
-	}
-
-	// Check for unsupported features.
-	if fbTrees.CtrFeaturesLength() > 0 {
-		return nil, fmt.Errorf("model uses CTR features which are not yet supported")
-	}
-	if fbTrees.TextFeaturesLength() > 0 {
-		return nil, fmt.Errorf("model uses text features which are not yet supported")
-	}
-	if fbTrees.EmbeddingFeaturesLength() > 0 {
-		return nil, fmt.Errorf("model uses embedding features which are not yet supported")
-	}
-
-	m, err := deserializeModel(&fbTrees)
-	if err != nil {
-		return nil, fmt.Errorf("deserializing model: %w", err)
-	}
-
-	// Collect model info.
-	for i := 0; i < core.InfoMapLength(); i++ {
-		var kv cbm.TKeyValue
-		if core.InfoMap(&kv, i) {
-			m.modelInfo[string(kv.Key())] = string(kv.Value())
-		}
-	}
-
-	return m, nil
+	return buildModel(&jm)
 }
 
-func hashCatFeatures(catFeatures []string) []int32 {
-	hashes := make([]int32, len(catFeatures))
-	for i, s := range catFeatures {
-		hashes[i] = int32(CatFeatureHash(s))
-	}
-	return hashes
-}
-
-// CalcSingle calculates model prediction on float features and string categorical
-// feature values for a single object. Pass float32(math.NaN()) for missing float
-// values. Pass nil for catFeatures if the model has no categorical features.
+// CalcSingle calculates a prediction for a single object.
+// Pass float32(math.NaN()) for missing float values.
+// Pass nil for catFeatures if the model has no categorical features.
 func (m *Model) CalcSingle(floatFeatures []float32, catFeatures []string) ([]float64, error) {
-	if err := m.validateInputs(floatFeatures, catFeatures); err != nil {
+	if err := validateInputs(m, floatFeatures, catFeatures); err != nil {
 		return nil, err
 	}
-	bins := m.quantize(floatFeatures, hashCatFeatures(catFeatures))
-	return m.eval(bins), nil
+	var catHashes [][]int32
+	if len(catFeatures) > 0 {
+		hashes := make([]int32, len(catFeatures))
+		for i, s := range catFeatures {
+			hashes[i] = int32(CatFeatureHash(s))
+		}
+		catHashes = [][]int32{hashes}
+	}
+	return m.evalBatch([][]float32{floatFeatures}, catHashes)[0], nil
 }
 
-// CalcHashedSingle calculates model prediction on float features and hashed
-// categorical feature values for a single object. Use CatFeatureHash to compute
-// the hashes, which avoids re-hashing the same strings on every call.
+// CalcHashedSingle calculates a prediction using pre-computed cat feature hashes.
+// Use CatFeatureHash to compute the hashes, which avoids re-hashing on every call.
 func (m *Model) CalcHashedSingle(floatFeatures []float32, catHashes []int32) ([]float64, error) {
-	if err := m.validateHashedInputs(floatFeatures, catHashes); err != nil {
+	if err := validateInputs(m, floatFeatures, catHashes); err != nil {
 		return nil, err
 	}
-	bins := m.quantize(floatFeatures, catHashes)
-	return m.eval(bins), nil
+	var allHashes [][]int32
+	if len(catHashes) > 0 {
+		allHashes = [][]int32{catHashes}
+	}
+	return m.evalBatch([][]float32{floatFeatures}, allHashes)[0], nil
 }
 
-// Calc calculates model predictions on float features and string categorical
-// feature values for multiple objects. Pass nil for catFeatures if the model
-// has no categorical features.
+// Calc calculates predictions for multiple objects.
+// Pass nil for catFeatures if the model has no categorical features.
 func (m *Model) Calc(floatFeatures [][]float32, catFeatures [][]string) ([][]float64, error) {
 	n := len(floatFeatures)
 	if catFeatures != nil && len(catFeatures) != n {
 		return nil, fmt.Errorf("floatFeatures and catFeatures have different lengths (%d vs %d)", n, len(catFeatures))
 	}
 
-	results := make([][]float64, n)
-	for i := range results {
+	for i := range floatFeatures {
 		var cats []string
 		if catFeatures != nil {
 			cats = catFeatures[i]
 		}
-		if err := m.validateInputs(floatFeatures[i], cats); err != nil {
+		if err := validateInputs(m, floatFeatures[i], cats); err != nil {
 			return nil, fmt.Errorf("document %d: %w", i, err)
 		}
-		bins := m.quantize(floatFeatures[i], hashCatFeatures(cats))
-		results[i] = m.eval(bins)
 	}
-	return results, nil
+
+	var allHashes [][]int32
+	if len(catFeatures) != 0 {
+		nCat := len(catFeatures[0])
+		flat := make([]int32, n*nCat)
+		allHashes = make([][]int32, n)
+
+		for i, cats := range catFeatures {
+			row := flat[i*nCat : (i+1)*nCat]
+			for j, s := range cats {
+				row[j] = int32(CatFeatureHash(s))
+			}
+			allHashes[i] = row
+		}
+	}
+
+	return m.evalBatch(floatFeatures, allHashes), nil
 }
 
-// CalcHashed calculates model predictions on float features and hashed categorical
-// feature values for multiple objects. Use CatFeatureHash to compute the hashes,
-// which avoids re-hashing the same strings on every call.
+// CalcHashed calculates predictions for multiple objects using pre-computed cat hashes.
 func (m *Model) CalcHashed(floatFeatures [][]float32, catHashes [][]int32) ([][]float64, error) {
 	n := len(floatFeatures)
 	if catHashes != nil && len(catHashes) != n {
 		return nil, fmt.Errorf("floatFeatures and catHashes have different lengths (%d vs %d)", n, len(catHashes))
 	}
-	results := make([][]float64, n)
-	for i := range results {
+
+	for i := range floatFeatures {
 		var hashes []int32
-		if catHashes != nil {
+		if len(catHashes) != 0 {
 			hashes = catHashes[i]
 		}
-		if err := m.validateHashedInputs(floatFeatures[i], hashes); err != nil {
+		if err := validateInputs(m, floatFeatures[i], hashes); err != nil {
 			return nil, fmt.Errorf("document %d: %w", i, err)
 		}
-		bins := m.quantize(floatFeatures[i], hashes)
-		results[i] = m.eval(bins)
 	}
-	return results, nil
+
+	return m.evalBatch(floatFeatures, catHashes), nil
 }
 
-// DimensionsCount returns the number of dimensions in the model:
-// 1 for regression and binary classification, N for N-class multiclass.
+// DimensionsCount returns 1 for regression/binary classification, N for multiclass.
 func (m *Model) DimensionsCount() int {
 	return m.approxDimension
 }
 
-// FloatFeaturesCount returns the minimum float feature slice length required by the model.
-// Ref: catboost/libs/model/model.h (GetNumFloatFeatures)
+// FloatFeaturesCount returns the number of float features the model expects.
 func (m *Model) FloatFeaturesCount() int {
-	return m.minFloatFeatures
+	return m.floatFeatureCount
 }
 
-// CatFeaturesCount returns the minimum cat feature slice length required by the model.
-// Ref: catboost/libs/model/model.h (GetNumCatFeatures)
+// CatFeaturesCount returns the number of categorical features the model expects.
 func (m *Model) CatFeaturesCount() int {
-	return m.minCatFeatures
+	return m.catFeatureCount
 }
 
-// InfoValue returns model metainfo for the given key. If the key is missing,
-// the second return value is false.
+// InfoValue returns model metainfo for the given key.
 func (m *Model) InfoValue(key string) (string, bool) {
 	v, ok := m.modelInfo[key]
 	return v, ok
 }
 
-// SetPredictionType sets the prediction type for model evaluation.
-// The default is RawFormulaVal.
+// SetPredictionType sets the prediction type. Default is RawFormulaVal.
 func (m *Model) SetPredictionType(pt PredictionType) {
 	m.predictionType = pt
 }
 
-func (m *Model) validateInputs(floatFeatures []float32, catFeatures []string) error {
-	if len(floatFeatures) < m.minFloatFeatures {
-		return fmt.Errorf("need at least %d float features, got %d", m.minFloatFeatures, len(floatFeatures))
+// SetProbabilityBorder sets the probability threshold for binary Class predictions.
+// The value must be in (0, 1). Default is 0.5 (equivalent to raw value border of 0).
+func (m *Model) SetProbabilityBorder(p float64) {
+	if p <= 0 || p >= 1 {
+		panic(fmt.Sprintf("probability border must be in (0, 1), got %v", p))
 	}
-	if len(catFeatures) < m.minCatFeatures {
-		return fmt.Errorf("need at least %d cat features, got %d", m.minCatFeatures, len(catFeatures))
-	}
-	return nil
+	m.binclassRawValBorder = -math.Log(1/p - 1)
 }
 
-func (m *Model) validateHashedInputs(floatFeatures []float32, catHashes []int32) error {
-	if len(floatFeatures) < m.minFloatFeatures {
-		return fmt.Errorf("need at least %d float features, got %d", m.minFloatFeatures, len(floatFeatures))
-	}
-	if len(catHashes) < m.minCatFeatures {
-		return fmt.Errorf("need at least %d cat features, got %d", m.minCatFeatures, len(catHashes))
-	}
-	return nil
-}
-
-// CatFeatureHash returns the hash for the given categorical feature string value.
-// NOTE: CatBoost uses a fork of CityHash 1.0 that differs from the standard Google
-// CityHash implementation.
+// CatFeatureHash returns the CatBoost hash for a categorical feature value.
 func CatFeatureHash(s string) uint32 {
-	return uint32(cityHash64([]byte(s)) & 0xffffffff)
+	sd := unsafe.Slice(unsafe.StringData(s), len(s))
+	return uint32(cityHash64(sd) & 0xffffffff)
+}
+
+func validateInputs[T any](m *Model, floatFeatures []float32, catFeatures []T) error {
+	if len(floatFeatures) < m.floatFeatureCount {
+		return fmt.Errorf("expected %d float features, got %d", m.floatFeatureCount, len(floatFeatures))
+	}
+	if len(catFeatures) < m.catFeatureCount {
+		return fmt.Errorf("expected %d cat features, got %d", m.catFeatureCount, len(catFeatures))
+	}
+	return nil
 }

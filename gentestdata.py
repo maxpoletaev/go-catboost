@@ -3,13 +3,15 @@
 Generate test models and expected predictions for the go-catboost test suite.
 
 Each fixture produces:
-  {name}.cbm   - CatBoost binary model
-  {name}.json  - feature info + samples + expected RawFormulaVal predictions
+  {name}_model.json.gz - the CatBoost model in json format, gzipped for compactness
+  {name}_test.json - feature info + samples + expected predictions
 
 Run from the repo root:
-  python3 gentestdata.py
+  python3 gentestdata.py  # rebuild all fixtures
+  python3 gentestdata.py float_regression cat_onehot_small  # rebuild selected fixtures
 """
 
+import gzip
 import json
 import math
 import os
@@ -72,11 +74,11 @@ def predict(
         # Python: (N, 2)  →  Go: (N, 1) using P(class=1)
         preds = preds[:, 1].reshape(-1, 1)
     elif prediction_type == "Class" and is_multiclass:
-        # Python: (N, 1) class index  →  Go: (N, K) one-hot
+        # Python: (N, 1) class index  →  Go: (N, K) with index in [0], rest zero
         idx = preds.flatten().astype(int)
-        one_hot = np.zeros((len(idx), n_classes), dtype=float)
-        one_hot[np.arange(len(idx)), idx] = 1.0
-        preds = one_hot
+        out = np.zeros((len(idx), n_classes), dtype=float)
+        out[:, 0] = idx.astype(float)
+        preds = out
     elif prediction_type == "Class" and is_binary:
         # Python: (N,) int64  →  Go: (N, 1) float
         preds = preds.reshape(-1, 1).astype(float)
@@ -109,7 +111,11 @@ def save(
     description="",
     prediction_type="RawFormulaVal",
 ):
-    model.save_model(os.path.join(OUT, f"{name}.cbm"), format="CatboostBinary")
+    tmp_json = os.path.join(OUT, f"{name}_model.json.tmp")
+    model.save_model(tmp_json, format="json")
+    with open(tmp_json, "rb") as src, gzip.open(os.path.join(OUT, f"{name}_model.json.gz"), "wb", compresslevel=9) as dst:
+        dst.write(src.read())
+    os.remove(tmp_json)
 
     preds = predict(
         model,
@@ -129,7 +135,7 @@ def save(
     }
     if prediction_type != "RawFormulaVal":
         fixture["prediction_type"] = prediction_type
-    with open(os.path.join(OUT, f"{name}.json"), "w") as f:
+    with open(os.path.join(OUT, f"{name}_test.json"), "w") as f:
         json.dump(fixture, f, indent=2)
 
     print(
@@ -834,6 +840,79 @@ def gen_nonsym_multiclass():
 
 
 # ---------------------------------------------------------------------------
+# 21. Multiclass — Class prediction type
+# ---------------------------------------------------------------------------
+def gen_multiclass_class():
+    n = 2000
+    X = rng_floats(n, 4)
+    y = np.argmax(X[:, :3], axis=1)
+
+    model = cb.CatBoostClassifier(
+        iterations=150,
+        depth=5,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=30,
+        classes_count=3,
+        loss_function="MultiClass",
+    )
+    model.fit(cb.Pool(X, y))
+
+    X_test = rng_floats(20, 4)
+    save(
+        "multiclass_class",
+        model,
+        X_test,
+        None,
+        float_count=4,
+        cat_count=0,
+        output_dim=3,
+        description="3-class classification with Class prediction type",
+        prediction_type="Class",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 22. CTR binary classification (no one_hot_max_size → CTR encoding)
+# ---------------------------------------------------------------------------
+def gen_ctr_binary():
+    n = 3000
+    vocab = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    X_float = rng_floats(n, 3)
+    X_cat = rng_cats(n, vocab)
+    y = (
+        X_float[:, 0]
+        + (X_cat[:, 0] == "A").astype(float)
+        - (X_cat[:, 0] == "H").astype(float)
+        > 0
+    ).astype(int)
+
+    model = cb.CatBoostClassifier(
+        iterations=100,
+        depth=4,
+        learning_rate=0.1,
+        verbose=False,
+        random_seed=100,
+        # No one_hot_max_size → uses CTR encoding
+    )
+    model.fit(build_pool(X_float, X_cat, y, cat_col_offset=3))
+
+    X_test_f = rng_floats(20, 3)
+    X_test_c = rng_cats(20, vocab)
+    save(
+        "ctr_binary",
+        model,
+        X_test_f,
+        X_test_c,
+        float_count=3,
+        cat_count=1,
+        output_dim=1,
+        cat_col_offset=3,
+        description="Binary classification with CTR cat encoding (no one_hot_max_size)",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 GENERATORS = [
@@ -854,10 +933,11 @@ GENERATORS = [
     gen_large_features,
     gen_extreme_values,
     gen_mixed_multiclass,
-    # Non-symmetric trees (grow_policy=Lossguide / Depthwise)
     gen_nonsym_regression,
     gen_nonsym_binary,
     gen_nonsym_multiclass,
+    gen_multiclass_class,
+    gen_ctr_binary,
 ]
 
 if __name__ == "__main__":
