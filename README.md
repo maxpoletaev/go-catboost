@@ -16,6 +16,10 @@ Proof-of-concept. Works on test models and test inputs, but not battle-tested. A
 * Only float and categorical (one-hot and ctr) features are supported.
 * Likely noticably slower (especially on large batches) than C++ core.
 
+## SIMD Support
+
+A SIMD-accelerated path is available on AMD64 with Go 1.26 and `GOEXPERIMENT=simd` enabled (via experimental [simd/archsimd](https://pkg.go.dev/simd/archsimd) package).
+
 ## Verification
 
 The correctness is verified against the Python `catboost` library across various model configurations using randomized inputs ([gentestdata.py](gentestdata.py)). Note that the result may differ by 1-2 ULPs depending on the platform due to floating-point arithmetic differences between Go and libc. Tests are written to tolerate that.
